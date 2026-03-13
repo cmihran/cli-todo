@@ -2,7 +2,7 @@ mod db;
 
 use crate::db::{Db, Priority, Status, Task};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -90,7 +90,11 @@ struct App {
     active_tab: ActiveTab,
     show_detail: bool,
     show_help: bool,
+    confirm_delete: bool,
     quit: bool,
+    // Layout areas for mouse hit-testing
+    table_area: ratatui::layout::Rect,
+    tab_area: ratatui::layout::Rect,
 }
 
 // ── App logic ───────────────────────────────────────────────────────────────
@@ -99,6 +103,7 @@ impl App {
     fn new(db: Db) -> Self {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
+        let zero_rect = ratatui::layout::Rect::default();
         let mut app = App {
             db,
             tasks: vec![],
@@ -106,7 +111,10 @@ impl App {
             active_tab: ActiveTab::All,
             show_detail: true,
             show_help: false,
+            confirm_delete: false,
             quit: false,
+            table_area: zero_rect,
+            tab_area: zero_rect,
         };
         app.reload_tasks();
         app
@@ -142,7 +150,31 @@ impl App {
             .and_then(|i| filtered.get(i).copied())
     }
 
+    fn delete_selected(&mut self) {
+        if let Some(tv) = self.selected_task_view() {
+            let id = tv.task.id;
+            let _ = self.db.delete_task(id);
+            self.reload_tasks();
+            // Clamp selection
+            let filtered_len = self.filtered_tasks().len();
+            if let Some(i) = self.table_state.selected() {
+                if i >= filtered_len && filtered_len > 0 {
+                    self.table_state.select(Some(filtered_len - 1));
+                } else if filtered_len == 0 {
+                    self.table_state.select(None);
+                }
+            }
+        }
+    }
+
     fn handle_key(&mut self, code: KeyCode) {
+        if self.confirm_delete {
+            if code == KeyCode::Char('y') {
+                self.delete_selected();
+            }
+            self.confirm_delete = false;
+            return;
+        }
         if self.show_help {
             self.show_help = false;
             return;
@@ -181,10 +213,96 @@ impl App {
                 };
                 self.table_state.select(Some(0));
             }
+            KeyCode::Char('x') | KeyCode::Delete => {
+                if self.selected_task_view().is_some() {
+                    self.confirm_delete = true;
+                }
+            }
             KeyCode::Char('d') => self.show_detail = !self.show_detail,
             KeyCode::Char('?') => self.show_help = true,
             _ => {}
         }
+    }
+
+    fn handle_mouse(&mut self, kind: MouseEventKind, column: u16, row: u16) {
+        match kind {
+            MouseEventKind::Down(_) => {
+                // Click on table row — select it (header is row 0, data starts at row 1)
+                if row > self.table_area.y && column >= self.table_area.x && column < self.table_area.x + self.table_area.width {
+                    let row_index = (row - self.table_area.y - 1) as usize; // -1 for header
+                    let filtered_len = self.filtered_tasks().len();
+                    if row_index < filtered_len {
+                        self.table_state.select(Some(row_index));
+                    }
+                }
+                // Click on tab area — switch tabs
+                if row >= self.tab_area.y && row < self.tab_area.y + self.tab_area.height {
+                    let x = column as usize;
+                    // Approximate tab boundaries based on rendered widths
+                    let tab_texts = self.tab_labels();
+                    let mut offset = 1; // leading padding
+                    for (i, label) in tab_texts.iter().enumerate() {
+                        let tab_width = label.len() + 2; // padding
+                        let sep_width = 3; // " │ "
+                        if x >= offset && x < offset + tab_width {
+                            self.active_tab = match i {
+                                0 => ActiveTab::All,
+                                1 => ActiveTab::Active,
+                                2 => ActiveTab::Blocked,
+                                3 => ActiveTab::Done,
+                                _ => self.active_tab,
+                            };
+                            self.table_state.select(Some(0));
+                            break;
+                        }
+                        offset += tab_width + sep_width;
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                let filtered_len = self.filtered_tasks().len();
+                if filtered_len > 0 {
+                    let i = self.table_state.selected().unwrap_or(0);
+                    self.table_state
+                        .select(Some(i.checked_sub(1).unwrap_or(filtered_len - 1)));
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                let filtered_len = self.filtered_tasks().len();
+                if filtered_len > 0 {
+                    let i = self.table_state.selected().unwrap_or(0);
+                    self.table_state.select(Some((i + 1) % filtered_len));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn tab_labels(&self) -> Vec<String> {
+        vec![
+            format!("All ({})", self.tasks.len()),
+            format!(
+                "Active ({})",
+                self.tasks
+                    .iter()
+                    .filter(|tv| tv.task.status == Status::InProgress || tv.task.status == Status::Todo)
+                    .count()
+            ),
+            format!(
+                "Blocked ({})",
+                self.tasks
+                    .iter()
+                    .filter(|tv| tv.task.status == Status::Blocked)
+                    .count()
+            ),
+            format!(
+                "Done ({})",
+                self.tasks
+                    .iter()
+                    .filter(|tv| tv.task.status == Status::Done)
+                    .count()
+            ),
+        ]
     }
 }
 
@@ -201,6 +319,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         ])
         .split(f.area());
 
+    app.tab_area = outer[1];
     render_header(f, outer[0]);
     render_tabs(f, outer[1], app);
     render_body(f, outer[2], app);
@@ -208,6 +327,9 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     if app.show_help {
         render_help_popup(f);
+    }
+    if app.confirm_delete {
+        render_delete_confirm(f, app);
     }
 }
 
@@ -277,9 +399,11 @@ fn render_body(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(area);
+        app.table_area = chunks[0];
         render_task_table(f, chunks[0], app);
         render_detail_panel(f, chunks[1], app);
     } else {
+        app.table_area = area;
         render_task_table(f, area, app);
     }
 }
@@ -611,6 +735,56 @@ fn render_help_popup(f: &mut Frame) {
     f.render_widget(help, popup_area);
 }
 
+fn render_delete_confirm(f: &mut Frame, app: &App) {
+    let title = app
+        .selected_task_view()
+        .map(|tv| tv.task.title.as_str())
+        .unwrap_or("this task");
+
+    let area = f.area();
+    let popup_width = 50u16.min(area.width.saturating_sub(4));
+    let popup_height = 5u16;
+    let popup_area = ratatui::layout::Rect {
+        x: (area.width.saturating_sub(popup_width)) / 2,
+        y: (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    f.render_widget(Clear, popup_area);
+
+    let mut display_title = title.to_string();
+    let max_len = (popup_width as usize).saturating_sub(6);
+    if display_title.len() > max_len {
+        display_title.truncate(max_len.saturating_sub(3));
+        display_title.push_str("...");
+    }
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Delete ", Style::default().fg(Color::Red)),
+            Span::styled(display_title, Style::default().fg(Color::White).bold()),
+            Span::styled("?", Style::default().fg(Color::Red)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Press ", Style::default().fg(Color::DarkGray)),
+            Span::styled("y", Style::default().fg(Color::Red).bold()),
+            Span::styled(" to confirm, any other key to cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let popup = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Red))
+            .style(Style::default().bg(Color::Rgb(25, 10, 10))),
+    );
+
+    f.render_widget(popup, popup_area);
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 fn main() -> io::Result<()> {
@@ -621,7 +795,9 @@ fn main() -> io::Result<()> {
         db.seed_sample_data().expect("failed to seed sample data");
     }
 
-    stdout().execute(EnterAlternateScreen)?;
+    stdout()
+        .execute(EnterAlternateScreen)?
+        .execute(EnableMouseCapture)?;
     enable_raw_mode()?;
 
     let mut terminal = Terminal::new(ratatui::backend::CrosstermBackend::new(stdout()))?;
@@ -630,10 +806,16 @@ fn main() -> io::Result<()> {
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
 
-        if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press {
-                app.handle_key(key.code);
+        match event::read()? {
+            Event::Key(key) => {
+                if key.kind == KeyEventKind::Press {
+                    app.handle_key(key.code);
+                }
             }
+            Event::Mouse(mouse) => {
+                app.handle_mouse(mouse.kind, mouse.column, mouse.row);
+            }
+            _ => {}
         }
 
         if app.quit {
@@ -642,6 +824,8 @@ fn main() -> io::Result<()> {
     }
 
     disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
+    stdout()
+        .execute(DisableMouseCapture)?
+        .execute(LeaveAlternateScreen)?;
     Ok(())
 }

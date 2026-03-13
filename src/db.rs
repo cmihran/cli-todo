@@ -133,23 +133,77 @@ impl Db {
     }
 
     pub fn seed_sample_data(&self) -> rusqlite::Result<()> {
+        // Dogfooding: use cli-todo to build cli-todo
         let tasks = vec![
-            ("Set up Rust project with ratatui", "done", "high", "setup,infra",
-             "Initialize cargo project, add ratatui + crossterm deps, get basic TUI rendering."),
-            ("Design task data model + SQLite schema", "in_progress", "high", "core,database",
-             "Define Task, Tag, Session tables. Use rusqlite. Need migrations strategy."),
-            ("Implement Claude Code session tracking", "todo", "critical", "core,claude",
-             "Track which Claude Code sessions are associated with each task. Parse session IDs from ~/.claude/projects/. Allow linking sessions to tasks via CLI command."),
-            ("Add keyboard-driven task creation flow", "todo", "medium", "ui",
-             "Inline task creation with title, priority picker, tag input. Should feel snappy — no modal dialogs."),
-            ("Build CLI subcommands (add, list, start)", "todo", "medium", "cli",
-             "Support both TUI mode and direct CLI commands: `todo add 'fix parser'`, `todo list --status blocked`, `todo start 3` (launches Claude with task context)."),
-            ("Fix rendering glitch on terminal resize", "blocked", "low", "bug,ui",
-             "Table columns don't reflow properly when terminal is resized below 80 cols. Need to handle resize events and set minimum widths."),
-            ("Export tasks to markdown", "todo", "low", "feature",
-             "Generate a markdown summary of all tasks, grouped by status. Useful for pasting into PRs or docs."),
-            ("Session replay / summary view", "todo", "medium", "feature,claude",
-             "Show a summary of what happened in each linked Claude Code session — files changed, commands run, key decisions. Pull from session JSON logs."),
+            // ── Done ────────────────────────────────────────
+            ("TUI with task list and tab filtering", "done", "high", "phase1,ui",
+             "Task table with All / Active / Blocked / Done tabs, counts per tab."),
+            ("Detail panel", "done", "high", "phase1,ui",
+             "Right-side panel showing status, priority, tags, description, linked sessions for selected task."),
+            ("SQLite persistence", "done", "high", "phase1,core",
+             "Store tasks in ~/.local/share/cli-todo/cli-todo.db via rusqlite with bundled SQLite."),
+            ("Vim-style navigation + mouse support", "done", "medium", "phase1,ui",
+             "j/k and arrow keys for navigation. Mouse click to select rows, click tabs, scroll wheel to navigate."),
+            ("Task deletion with confirmation", "done", "medium", "phase1,ui",
+             "Press x to delete, y to confirm. Popup with task title and cancel option."),
+            ("Help popup", "done", "low", "phase1,ui",
+             "Press ? to show keybinding reference overlay."),
+
+            // ── Phase 1: Task management ────────────────────
+            ("Add tasks inline from TUI", "todo", "high", "phase1,ui",
+             "Press a, type title, pick priority. Should feel as quick as typing a commit message. No modal wizard."),
+            ("Edit task fields inline", "todo", "high", "phase1,ui",
+             "Edit title, description, priority, tags on the selected task without leaving the TUI."),
+            ("Cycle task status with keybinding", "todo", "high", "phase1,ui",
+             "Press s to cycle: todo -> in_progress -> done. Maybe shift+s for blocked."),
+            ("Projects as first-class concept", "todo", "high", "phase1,core",
+             "Projects are logical groupings (an app, a system, a library) — not tied to directories. Add projects table, create/switch/list in TUI. Single DB, multiple projects."),
+            ("Task hierarchy / subtasks", "todo", "medium", "phase1,core",
+             "Tasks can have subtasks. Need parent_id in schema. UI should show nesting — maybe indent or tree view."),
+            ("Full-text search across tasks", "todo", "medium", "phase1,ui",
+             "Press / to search. Filter task list by title and description matches."),
+
+            // ── Phase 2: Developer cockpit ──────────────────
+            ("Integrated terminal panes", "todo", "high", "phase2,ui",
+             "Embed shell sessions inside the TUI. Run commands, launch Claude Code, see output — all without leaving the app."),
+            ("Split-pane layouts", "todo", "high", "phase2,ui",
+             "Task board + terminal + artifact viewer side by side. Configurable splits like tmux."),
+            ("Window management keybindings", "todo", "medium", "phase2,ui",
+             "Split, resize, focus, close panes. Vim-style or tmux-style bindings."),
+            ("Shared context across panes", "todo", "medium", "phase2,core",
+             "Terminal panes know which task/project is active. Context flows between panes."),
+
+            // ── Phase 3: Artifact system ────────────────────
+            ("Link markdown files to tasks", "todo", "medium", "phase3,artifacts",
+             "Associate .md files on disk with tasks. Track in DB, surface in detail panel."),
+            ("View/edit artifacts in TUI", "todo", "medium", "phase3,ui",
+             "Read and edit markdown artifacts from within the app. Syntax highlighting."),
+            ("Artifact creation flow", "todo", "medium", "phase3,artifacts",
+             "Create new artifact from task context. Template with task title, description, etc."),
+            ("Track artifact freshness", "todo", "low", "phase3,artifacts",
+             "Compare artifact last-modified vs related code changes. Flag stale artifacts."),
+
+            // ── Phase 4: Claude integration via MCP ─────────
+            ("MCP server for task CRUD", "todo", "high", "phase4,claude",
+             "Expose get_tasks, create_task, update_status, delete_task to Claude Code via MCP."),
+            ("MCP server for artifact read/write", "todo", "medium", "phase4,claude",
+             "Expose list_artifacts, read_artifact, write_artifact to Claude Code via MCP."),
+            ("Launch Claude sessions scoped to a task", "todo", "high", "phase4,claude",
+             "Start Claude Code pre-loaded with task context and relevant artifacts."),
+            ("Claude can manage tasks from any session", "todo", "medium", "phase4,claude",
+             "Any Claude Code session with the MCP server can create/update/query tasks."),
+            ("Session history tracking per task", "todo", "low", "phase4,claude",
+             "Record which Claude sessions were linked to each task. View history in detail panel."),
+
+            // ── Phase 5: Context engine ─────────────────────
+            ("Local vector store for artifacts", "todo", "low", "phase5,context",
+             "Embed artifacts and task descriptions. Local model, no cloud dependency."),
+            ("Intelligent context retrieval", "todo", "low", "phase5,context",
+             "When launching a Claude session, RAG-retrieve only the relevant artifacts. Surgical context injection."),
+            ("Artifact-code drift detection", "todo", "low", "phase5,context",
+             "Detect when code has changed in ways that make artifacts stale. Flag for review."),
+            ("Bidirectional sync (code <-> artifacts)", "todo", "low", "phase5,context",
+             "Update artifact -> Claude implements code changes. Update code -> Claude updates artifacts."),
         ];
 
         for (title, status, priority, tags, desc) in tasks {
@@ -158,24 +212,6 @@ impl Db {
                 params![title, status, priority, tags, desc],
             )?;
         }
-
-        // Add some sample sessions
-        self.conn.execute(
-            "INSERT INTO sessions (task_id, session_id) VALUES (1, 'ses_01JA3K...')",
-            [],
-        )?;
-        self.conn.execute(
-            "INSERT INTO sessions (task_id, session_id) VALUES (2, 'ses_01JA4M...')",
-            [],
-        )?;
-        self.conn.execute(
-            "INSERT INTO sessions (task_id, session_id) VALUES (2, 'ses_01JA5N...')",
-            [],
-        )?;
-        self.conn.execute(
-            "INSERT INTO sessions (task_id, session_id) VALUES (6, 'ses_01JA6P...')",
-            [],
-        )?;
 
         Ok(())
     }

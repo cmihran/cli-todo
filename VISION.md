@@ -1,34 +1,84 @@
 # cli-todo — vision
 
-A terminal-native task tracker built for developers who use Claude Code as their daily driver.
+## What is this?
+
+A terminal-native developer control plane. Not just a task tracker — a full-screen workspace that replaces VS Code + tmux, acting as the single interface between your brain, your code, and your Claude Code sessions.
+
+The core insight: **conversations are ephemeral, but artifacts are permanent.** Claude sessions come and go, context windows fill up and reset. But well-maintained artifacts — specs, design docs, task descriptions — survive across sessions and give any new agent instant context. This tool is the system that creates, maintains, and serves those artifacts.
 
 ---
 
-## The problem
+## The problems we're solving
 
-You're working across multiple projects, spinning up Claude Code sessions throughout the day. Each session does meaningful work — but there's no connective tissue between them. You lose track of:
-- What you asked Claude to do and why
-- Which sessions relate to which goals
-- What's blocked, what's done, what's next
-- The bigger picture across days and weeks
+1. **Context fragmentation.** You spin up Claude sessions throughout the day. Each one does meaningful work, but there's no connective tissue between them. Knowledge lives in conversations that are hard to find and impossible to search.
 
-Existing tools (Jira, Linear, Notion) are browser-based, heavyweight, and disconnected from your terminal workflow.
+2. **Context anxiety.** Constantly worrying about hitting context window limits. Wondering which chat has which information. Losing work when a session gets too long.
+
+3. **Artifact-code drift.** You write a great design doc with Claude, then change the code, and now the doc is wrong. New agents read the stale doc and get confused. The reverse too — you update a spec but the code doesn't match.
+
+4. **Tool fragmentation.** Browser for Jira, terminal for code, separate tmux panes with no shared state. Nothing talks to anything else.
 
 ---
 
-## Core idea
+## The vision
 
-A CLI tool that lives where you work — the terminal — and acts as the bridge between your task planning and your Claude Code sessions.
+A full-screen terminal application that you open, maximize, and live in. Think of it as an IDE for your development workflow:
+
+- **Left pane**: your task board — projects, tasks, subtasks, status, priority
+- **Right pane**: detail view — task description, linked artifacts, session history
+- **Integrated terminal panes**: run Claude Code sessions that are aware of your task context
+- **Artifact management**: create, edit, and view persistent documents that stay in sync with code
+- **Project switching**: like an IDE switching folders — one DB, multiple projects, each scoped to a directory
+
+Claude sessions launched from this tool know about your tasks, your artifacts, and your project state via MCP. When Claude changes code, artifacts can update. When you update an artifact, Claude can implement the changes.
 
 ---
 
 ## What it should feel like
 
-- **Fast.** Instant startup, no loading spinners. A compiled binary, not a web app.
-- **Keyboard-first.** Vim-style navigation. No mouse needed, ever.
-- **Minimal friction.** Adding a task should be as quick as typing a commit message.
-- **Portable.** Clone the repo, `cargo build`, done. No Docker, no cloud accounts, no API keys.
-- **Local-first.** SQLite file on disk. Your data is yours.
+- **Fast.** Instant startup, compiled binary. Not a web app.
+- **Keyboard-first, mouse-friendly.** Vim-style navigation, but clicking and scrolling work too.
+- **Minimal friction.** Adding a task is as quick as typing a commit message.
+- **Portable.** Clone the repo, `cargo build`, copy the binary. No Docker, no cloud accounts, no API keys.
+- **Local-first.** SQLite on disk. Separate DB per machine. Your data is yours.
+- **Full-screen.** This is your workspace, not a sidebar widget.
+
+---
+
+## Architecture
+
+### Data model
+
+```
+Global DB (~/.local/share/cli-todo/cli-todo.db)
+  └── Projects (logical grouping — an app, a system, a library)
+       └── Tasks
+            ├── Subtasks
+            ├── Linked artifacts (markdown files on disk)
+            └── Linked Claude sessions
+```
+
+Projects are logical, not filesystem-bound. A monorepo might contain 10 apps — each is its own project in the tool, even though they share a directory. Projects can optionally reference paths, but don't have to. Think of them like namespaces for your work, not folder shortcuts.
+
+### Artifact system
+
+**Phase 1 — Markdown files on disk.**
+Artifacts are `.md` files stored alongside project code (e.g. `docs/design.md`, `.artifacts/auth-flow.md`). Claude reads these natively. The tool tracks which artifacts belong to which tasks and surfaces them in the detail panel.
+
+**Phase 2 — MCP server.**
+An MCP server exposes the task DB and artifact index to any Claude Code session. Claude gets tools like `get_tasks`, `create_task`, `update_status`, `list_artifacts`, `read_artifact`. Any Claude session launched from the tool — or even standalone — can interact with your task board.
+
+**Phase 3 — Context engine (RAG).**
+Embed artifacts and task descriptions into a local vector store. When starting a Claude session for a task, intelligently retrieve and inject only the relevant context — not everything, just what matters for that specific work. Solve the context window problem by being surgical about what goes in.
+
+### Bidirectional sync
+
+The hardest and most valuable problem:
+
+- **Code → Artifacts**: When Claude changes code, detect affected artifacts and flag them as potentially stale. Optionally auto-update them.
+- **Artifacts → Code**: When you update a spec or design doc, the tool can prompt Claude to implement the changes to match.
+
+This is the thing that makes artifacts trustworthy. Without sync, artifacts rot. With sync, they're a reliable source of truth.
 
 ---
 
@@ -36,91 +86,72 @@ A CLI tool that lives where you work — the terminal — and acts as the bridge
 
 - [x] TUI with task list, tab filtering (All / Active / Blocked / Done)
 - [x] Detail panel with status, priority, tags, description, linked sessions
-- [x] SQLite persistence (~/.local/share/cli-todo/cli-todo.db)
-- [x] Vim-style navigation (j/k), help popup
+- [x] SQLite persistence
+- [x] Vim-style navigation (j/k) + mouse support (click, scroll)
+- [x] Task deletion with confirmation
+- [x] Help popup
 - [x] Sample data seeding on first run
 
 ---
 
-## Features — next up
+## Roadmap
 
-### Task management (the basics)
-- [ ] Add tasks inline from TUI (press `a`, type title, pick priority)
+### Phase 1 — Solid task management
+- [ ] Add tasks inline from TUI
 - [ ] Edit task title/description/priority/tags inline
-- [ ] Cycle task status with a keybinding (e.g. `s` to cycle todo → in_progress → done)
-- [ ] Delete/archive tasks
-- [ ] Reorder tasks (manual priority ordering within a status group?)
+- [ ] Cycle task status with a keybinding
+- [ ] Projects as a first-class concept (create, switch, list)
+- [ ] Task hierarchy (subtasks)
+- [ ] Full-text search across tasks
 
-### Claude Code integration
-- [ ] Link a Claude Code session to a task (`todo link <task_id> <session_id>`)
-- [ ] Launch a new Claude Code session scoped to a task (`todo start <task_id>`)
-  - Pre-populates Claude with task context (title, description, related files?)
-- [ ] View session history per task — what files were touched, what happened
-- [ ] Auto-detect current session and suggest task linking
+### Phase 2 — Developer cockpit
+- [ ] Integrated terminal panes (embed shell/Claude sessions in the TUI)
+- [ ] Split-pane layouts (task board + terminal + artifact viewer)
+- [ ] Window management keybindings (split, resize, focus, close)
+- [ ] Shared context across panes
 
-### CLI mode (non-TUI)
-- [ ] `todo add "fix the parser" --priority high --tags core,parser`
-- [ ] `todo list` / `todo list --status blocked`
-- [ ] `todo done <id>` / `todo block <id>`
-- [ ] Pipe-friendly output for scripting
+### Phase 3 — Artifact system
+- [ ] Link markdown files to tasks as artifacts
+- [ ] View/edit artifacts from within the TUI
+- [ ] Artifact creation flow (from task context)
+- [ ] Track artifact freshness (last modified vs related code changes)
 
-### Search and filtering
-- [ ] Full-text search across task titles and descriptions
-- [ ] Filter by tag
-- [ ] Filter by date range (created/updated)
+### Phase 4 — Claude integration via MCP
+- [ ] MCP server exposing task CRUD
+- [ ] MCP server exposing artifact read/write
+- [ ] Launch Claude Code sessions scoped to a task (pre-loaded with relevant artifacts)
+- [ ] Claude can create/update tasks from within any session
+- [ ] Session history tracking per task
 
----
-
-## Features — someday/maybe
-
-- [ ] Project scoping (different task databases per project directory?)
-- [ ] Time tracking (how long was a task in "in_progress"?)
-- [ ] Task dependencies / subtasks
-- [ ] Markdown export for standup notes or PR descriptions
-- [ ] Git integration (link tasks to branches/commits)
-- [ ] Sync across machines (git-backed SQLite? CRDTs? Or just keep it simple and use one machine?)
-- [ ] Notifications/reminders for blocked tasks
-- [ ] Dashboard view — summary stats, burndown-style visualization
+### Phase 5 — Context engine
+- [ ] Local embedding/vector store for artifacts and task descriptions
+- [ ] Intelligent context retrieval when launching Claude sessions
+- [ ] Artifact-code drift detection
+- [ ] Bidirectional sync (code ↔ artifacts)
 
 ---
 
-## Open questions
+## Decisions made
 
-Things to think about before building further:
-
-1. **Scope per project vs global?**
-   One database for everything, or a .cli-todo.db per project directory? Global is simpler. Per-project is more contained. Could support both?
-
-2. **How deep should Claude Code integration go?**
-   Minimal: just store session IDs as metadata on tasks.
-   Medium: parse session logs to show summaries of what happened.
-   Deep: auto-create tasks from Claude conversations, two-way sync.
-
-3. **Multi-machine story?**
-   You mentioned wanting to clone and run this on your work PC. The binary is portable, but what about the task data? Options:
-   - Just accept separate databases per machine
-   - Store the DB in a git repo or synced folder
-   - Build actual sync (ambitious)
-
-4. **CLI vs TUI — primary interface?**
-   Is the TUI the main way to use this, with CLI as a convenience? Or should CLI be first-class for scripting/automation?
-
-5. **Task granularity?**
-   Are these high-level goals ("implement auth system") or small todos ("fix null check in parser.rs")? Both? Does the UI need to support hierarchy?
-
-6. **What makes this better than a TODO.md file?**
-   The answer should be: Claude Code session tracking, status management, and the TUI. If those aren't compelling, keep it simpler.
+| Question | Decision |
+|----------|----------|
+| Scope | Single global DB, projects are logical groupings (not tied to directories) |
+| Multi-machine | Separate DB per machine, no sync |
+| Primary interface | TUI (CLI commands may come later) |
+| Task granularity | Hierarchical — projects → tasks → subtasks |
+| Artifact storage | Markdown files on disk, indexed in DB |
+| Claude integration | MCP server (Claude gets tools to interact with the system) |
+| Input style | Keyboard-first, mouse-friendly |
 
 ---
 
 ## Non-goals
 
-Things this tool should NOT try to be:
-
-- A team collaboration tool (this is single-player)
-- A project management platform (no sprints, no story points, no Gantt charts)
-- A note-taking app (use Obsidian/Notion for that)
-- A replacement for git (no branching, no version control of tasks)
+- Team collaboration (this is single-player)
+- Sprint planning / story points / Gantt charts
+- Note-taking app (artifacts are project docs, not a knowledge base)
+- Replacing git
+- Cloud sync / SaaS
 
 ---
 
@@ -128,5 +159,7 @@ Things this tool should NOT try to be:
 
 - **Language:** Rust
 - **TUI:** Ratatui + Crossterm
-- **Storage:** SQLite via rusqlite (bundled, no system deps)
-- **CLI parsing:** TBD (clap? Just args?)
+- **Storage:** SQLite via rusqlite (bundled)
+- **CLI parsing:** TBD (clap)
+- **MCP server:** TBD (likely a separate binary or mode)
+- **Embeddings (Phase 5):** TBD (local model, no cloud dependency)
