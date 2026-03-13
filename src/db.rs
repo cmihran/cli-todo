@@ -78,6 +78,7 @@ impl Priority {
 #[derive(Clone)]
 pub struct Task {
     pub id: i64,
+    pub parent_id: Option<i64>,
     pub title: String,
     pub status: Status,
     pub priority: Priority,
@@ -96,6 +97,7 @@ impl Db {
             std::fs::create_dir_all(parent).ok();
         }
         let conn = Connection::open(&path)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let db = Db { conn };
         db.migrate()?;
         Ok(db)
@@ -122,7 +124,17 @@ impl Db {
             );
 
             CREATE INDEX IF NOT EXISTS idx_sessions_task_id ON sessions(task_id);",
-        )
+        )?;
+
+        // Migration: add parent_id for task nesting
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE tasks ADD COLUMN parent_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE;",
+        );
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_parent_id ON tasks(parent_id);",
+        )?;
+
+        Ok(())
     }
 
     pub fn is_empty(&self) -> rusqlite::Result<bool> {
@@ -134,95 +146,165 @@ impl Db {
 
     pub fn seed_sample_data(&self) -> rusqlite::Result<()> {
         // Dogfooding: use cli-todo to build cli-todo
-        let tasks = vec![
-            // ── Done ────────────────────────────────────────
-            ("TUI with task list and tab filtering", "done", "high", "phase1,ui",
+        // Phase parents first, then nest children under them
+
+        let phase1 = self.add_task(
+            "Phase 1 — Task Management",
+            Priority::High,
+            &["phase1".into()],
+            "Core task management features: CRUD, hierarchy, search.",
+            None,
+        )?;
+
+        // Phase 1 — Done
+        for (title, status, priority, tags, desc) in [
+            ("TUI with task list and tab filtering", "done", "high", "ui",
              "Task table with All / Active / Blocked / Done tabs, counts per tab."),
-            ("Detail panel", "done", "high", "phase1,ui",
+            ("Detail panel", "done", "high", "ui",
              "Right-side panel showing status, priority, tags, description, linked sessions for selected task."),
-            ("SQLite persistence", "done", "high", "phase1,core",
+            ("SQLite persistence", "done", "high", "core",
              "Store tasks in ~/.local/share/cli-todo/cli-todo.db via rusqlite with bundled SQLite."),
-            ("Vim-style navigation + mouse support", "done", "medium", "phase1,ui",
+            ("Vim-style navigation + mouse support", "done", "medium", "ui",
              "j/k and arrow keys for navigation. Mouse click to select rows, click tabs, scroll wheel to navigate."),
-            ("Task deletion with confirmation", "done", "medium", "phase1,ui",
+            ("Task deletion with confirmation", "done", "medium", "ui",
              "Press x to delete, y to confirm. Popup with task title and cancel option."),
-            ("Help popup", "done", "low", "phase1,ui",
+            ("Help popup", "done", "low", "ui",
              "Press ? to show keybinding reference overlay."),
+        ] {
+            self.insert_task(title, status, priority, tags, desc, Some(phase1))?;
+        }
 
-            // ── Phase 1: Task management ────────────────────
-            ("Add tasks inline from TUI", "todo", "high", "phase1,ui",
+        // Phase 1 — Todo
+        for (title, status, priority, tags, desc) in [
+            ("Add tasks inline from TUI", "todo", "high", "ui",
              "Press a, type title, pick priority. Should feel as quick as typing a commit message. No modal wizard."),
-            ("Edit task fields inline", "todo", "high", "phase1,ui",
+            ("Edit task fields inline", "todo", "high", "ui",
              "Edit title, description, priority, tags on the selected task without leaving the TUI."),
-            ("Cycle task status with keybinding", "todo", "high", "phase1,ui",
+            ("Cycle task status with keybinding", "todo", "high", "ui",
              "Press s to cycle: todo -> in_progress -> done. Maybe shift+s for blocked."),
-            ("Projects as first-class concept", "todo", "high", "phase1,core",
+            ("Projects as first-class concept", "todo", "high", "core",
              "Projects are logical groupings (an app, a system, a library) — not tied to directories. Add projects table, create/switch/list in TUI. Single DB, multiple projects."),
-            ("Task hierarchy / subtasks", "todo", "medium", "phase1,core",
-             "Tasks can have subtasks. Need parent_id in schema. UI should show nesting — maybe indent or tree view."),
-            ("Full-text search across tasks", "todo", "medium", "phase1,ui",
+            ("Task hierarchy / subtasks", "in_progress", "medium", "core",
+             "Tasks can have subtasks. Need parent_id in schema. UI should show nesting — tree view with expand/collapse."),
+            ("Full-text search across tasks", "todo", "medium", "ui",
              "Press / to search. Filter task list by title and description matches."),
+        ] {
+            self.insert_task(title, status, priority, tags, desc, Some(phase1))?;
+        }
 
-            // ── Phase 2: Developer cockpit ──────────────────
-            ("Integrated terminal panes", "todo", "high", "phase2,ui",
+        let phase2 = self.add_task(
+            "Phase 2 — Developer Cockpit",
+            Priority::High,
+            &["phase2".into()],
+            "Integrated terminal panes and split-pane layouts.",
+            None,
+        )?;
+
+        for (title, status, priority, tags, desc) in [
+            ("Integrated terminal panes", "todo", "high", "ui",
              "Embed shell sessions inside the TUI. Run commands, launch Claude Code, see output — all without leaving the app."),
-            ("Split-pane layouts", "todo", "high", "phase2,ui",
+            ("Split-pane layouts", "todo", "high", "ui",
              "Task board + terminal + artifact viewer side by side. Configurable splits like tmux."),
-            ("Window management keybindings", "todo", "medium", "phase2,ui",
+            ("Window management keybindings", "todo", "medium", "ui",
              "Split, resize, focus, close panes. Vim-style or tmux-style bindings."),
-            ("Shared context across panes", "todo", "medium", "phase2,core",
+            ("Shared context across panes", "todo", "medium", "core",
              "Terminal panes know which task/project is active. Context flows between panes."),
+        ] {
+            self.insert_task(title, status, priority, tags, desc, Some(phase2))?;
+        }
 
-            // ── Phase 3: Artifact system ────────────────────
-            ("Link markdown files to tasks", "todo", "medium", "phase3,artifacts",
+        let phase3 = self.add_task(
+            "Phase 3 — Artifact System",
+            Priority::Medium,
+            &["phase3".into()],
+            "Persistent artifacts linked to tasks, viewable in TUI.",
+            None,
+        )?;
+
+        for (title, status, priority, tags, desc) in [
+            ("Link markdown files to tasks", "todo", "medium", "artifacts",
              "Associate .md files on disk with tasks. Track in DB, surface in detail panel."),
-            ("View/edit artifacts in TUI", "todo", "medium", "phase3,ui",
+            ("View/edit artifacts in TUI", "todo", "medium", "ui",
              "Read and edit markdown artifacts from within the app. Syntax highlighting."),
-            ("Artifact creation flow", "todo", "medium", "phase3,artifacts",
+            ("Artifact creation flow", "todo", "medium", "artifacts",
              "Create new artifact from task context. Template with task title, description, etc."),
-            ("Track artifact freshness", "todo", "low", "phase3,artifacts",
+            ("Track artifact freshness", "todo", "low", "artifacts",
              "Compare artifact last-modified vs related code changes. Flag stale artifacts."),
+        ] {
+            self.insert_task(title, status, priority, tags, desc, Some(phase3))?;
+        }
 
-            // ── Phase 4: Claude integration via MCP ─────────
-            ("MCP server for task CRUD", "todo", "high", "phase4,claude",
+        let phase4 = self.add_task(
+            "Phase 4 — Claude Integration via MCP",
+            Priority::Medium,
+            &["phase4".into()],
+            "MCP server exposing tasks and artifacts to Claude Code sessions.",
+            None,
+        )?;
+
+        for (title, status, priority, tags, desc) in [
+            ("MCP server for task CRUD", "todo", "high", "claude",
              "Expose get_tasks, create_task, update_status, delete_task to Claude Code via MCP."),
-            ("MCP server for artifact read/write", "todo", "medium", "phase4,claude",
+            ("MCP server for artifact read/write", "todo", "medium", "claude",
              "Expose list_artifacts, read_artifact, write_artifact to Claude Code via MCP."),
-            ("Launch Claude sessions scoped to a task", "todo", "high", "phase4,claude",
+            ("Launch Claude sessions scoped to a task", "todo", "high", "claude",
              "Start Claude Code pre-loaded with task context and relevant artifacts."),
-            ("Claude can manage tasks from any session", "todo", "medium", "phase4,claude",
+            ("Claude can manage tasks from any session", "todo", "medium", "claude",
              "Any Claude Code session with the MCP server can create/update/query tasks."),
-            ("Session history tracking per task", "todo", "low", "phase4,claude",
+            ("Session history tracking per task", "todo", "low", "claude",
              "Record which Claude sessions were linked to each task. View history in detail panel."),
+        ] {
+            self.insert_task(title, status, priority, tags, desc, Some(phase4))?;
+        }
 
-            // ── Phase 5: Context engine ─────────────────────
-            ("Local vector store for artifacts", "todo", "low", "phase5,context",
+        let phase5 = self.add_task(
+            "Phase 5 — Context Engine",
+            Priority::Low,
+            &["phase5".into()],
+            "RAG-based context retrieval and artifact-code sync.",
+            None,
+        )?;
+
+        for (title, status, priority, tags, desc) in [
+            ("Local vector store for artifacts", "todo", "low", "context",
              "Embed artifacts and task descriptions. Local model, no cloud dependency."),
-            ("Intelligent context retrieval", "todo", "low", "phase5,context",
+            ("Intelligent context retrieval", "todo", "low", "context",
              "When launching a Claude session, RAG-retrieve only the relevant artifacts. Surgical context injection."),
-            ("Artifact-code drift detection", "todo", "low", "phase5,context",
+            ("Artifact-code drift detection", "todo", "low", "context",
              "Detect when code has changed in ways that make artifacts stale. Flag for review."),
-            ("Bidirectional sync (code <-> artifacts)", "todo", "low", "phase5,context",
+            ("Bidirectional sync (code <-> artifacts)", "todo", "low", "context",
              "Update artifact -> Claude implements code changes. Update code -> Claude updates artifacts."),
-        ];
-
-        for (title, status, priority, tags, desc) in tasks {
-            self.conn.execute(
-                "INSERT INTO tasks (title, status, priority, tags, description) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![title, status, priority, tags, desc],
-            )?;
+        ] {
+            self.insert_task(title, status, priority, tags, desc, Some(phase5))?;
         }
 
         Ok(())
     }
 
+    /// Internal helper for seed data — inserts with explicit status and parent_id.
+    fn insert_task(
+        &self,
+        title: &str,
+        status: &str,
+        priority: &str,
+        tags: &str,
+        description: &str,
+        parent_id: Option<i64>,
+    ) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO tasks (title, status, priority, tags, description, parent_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![title, status, priority, tags, description, parent_id],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
     pub fn all_tasks(&self) -> rusqlite::Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, status, priority, tags, description FROM tasks ORDER BY id",
+            "SELECT id, parent_id, title, status, priority, tags, description FROM tasks ORDER BY parent_id NULLS FIRST, id",
         )?;
         let tasks = stmt
             .query_map([], |row| {
-                let tags_str: String = row.get(4)?;
+                let tags_str: String = row.get(5)?;
                 let tags: Vec<String> = if tags_str.is_empty() {
                     vec![]
                 } else {
@@ -230,11 +312,12 @@ impl Db {
                 };
                 Ok(Task {
                     id: row.get(0)?,
-                    title: row.get(1)?,
-                    status: Status::from_str(&row.get::<_, String>(2)?),
-                    priority: Priority::from_str(&row.get::<_, String>(3)?),
+                    parent_id: row.get(1)?,
+                    title: row.get(2)?,
+                    status: Status::from_str(&row.get::<_, String>(3)?),
+                    priority: Priority::from_str(&row.get::<_, String>(4)?),
                     tags,
-                    description: row.get(5)?,
+                    description: row.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -266,11 +349,12 @@ impl Db {
         priority: Priority,
         tags: &[String],
         description: &str,
+        parent_id: Option<i64>,
     ) -> rusqlite::Result<i64> {
         let tags_str = tags.join(",");
         self.conn.execute(
-            "INSERT INTO tasks (title, priority, tags, description) VALUES (?1, ?2, ?3, ?4)",
-            params![title, priority.as_str(), tags_str, description],
+            "INSERT INTO tasks (title, priority, tags, description, parent_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![title, priority.as_str(), tags_str, description, parent_id],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -284,11 +368,32 @@ impl Db {
     }
 
     pub fn delete_task(&self, task_id: i64) -> rusqlite::Result<()> {
-        self.conn
-            .execute("DELETE FROM sessions WHERE task_id = ?1", params![task_id])?;
+        // CASCADE handles children and sessions automatically
         self.conn
             .execute("DELETE FROM tasks WHERE id = ?1", params![task_id])?;
         Ok(())
+    }
+
+    pub fn reparent_task(&self, task_id: i64, new_parent_id: Option<i64>) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET parent_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![new_parent_id, task_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn descendant_count(&self, task_id: i64) -> rusqlite::Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "WITH RECURSIVE descendants AS (
+                SELECT id FROM tasks WHERE parent_id = ?1
+                UNION ALL
+                SELECT t.id FROM tasks t JOIN descendants d ON t.parent_id = d.id
+            )
+            SELECT COUNT(*) FROM descendants",
+            params![task_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
     }
 }
 

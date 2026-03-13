@@ -2,7 +2,10 @@ mod db;
 
 use crate::db::{Db, Priority, Status, Task};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+        MouseEventKind,
+    },
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -16,6 +19,7 @@ use ratatui::{
     },
     Frame, Terminal,
 };
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, stdout};
 
 // ── UI helpers for Status/Priority colors ───────────────────────────────────
@@ -48,6 +52,40 @@ fn priority_color(p: Priority) -> Color {
 }
 
 // ── App types ───────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq)]
+enum GroupBy {
+    None,
+    Status,
+    Priority,
+    Tag,
+}
+
+impl GroupBy {
+    fn label(self) -> &'static str {
+        match self {
+            GroupBy::None => "none",
+            GroupBy::Status => "status",
+            GroupBy::Priority => "priority",
+            GroupBy::Tag => "tag",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            GroupBy::None => GroupBy::Status,
+            GroupBy::Status => GroupBy::Priority,
+            GroupBy::Priority => GroupBy::Tag,
+            GroupBy::Tag => GroupBy::None,
+        }
+    }
+}
+
+/// A row in the display list — either a group header or a task reference.
+enum DisplayRow {
+    Header(String),
+    Task { idx: usize, depth: usize },
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum ActiveTab {
@@ -88,10 +126,20 @@ struct App {
     tasks: Vec<TaskView>,
     table_state: TableState,
     active_tab: ActiveTab,
+    group_by: GroupBy,
+    tag_filter: Option<String>,
+    show_tag_picker: bool,
+    tag_picker_state: TableState,
     show_detail: bool,
     show_help: bool,
     confirm_delete: bool,
+    collapsed: HashSet<i64>,
     quit: bool,
+    // Inline task creation
+    input_mode: bool,
+    input_buffer: String,
+    input_cursor: usize,
+    input_parent_id: Option<i64>,
     // Layout areas for mouse hit-testing
     table_area: ratatui::layout::Rect,
     tab_area: ratatui::layout::Rect,
@@ -104,15 +152,26 @@ impl App {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
         let zero_rect = ratatui::layout::Rect::default();
+        let mut tag_picker_state = TableState::default();
+        tag_picker_state.select(Some(0));
         let mut app = App {
             db,
             tasks: vec![],
             table_state,
             active_tab: ActiveTab::All,
+            group_by: GroupBy::None,
+            tag_filter: None,
+            show_tag_picker: false,
+            tag_picker_state,
             show_detail: true,
             show_help: false,
             confirm_delete: false,
+            collapsed: HashSet::new(),
             quit: false,
+            input_mode: false,
+            input_buffer: String::new(),
+            input_cursor: 0,
+            input_parent_id: None,
             table_area: zero_rect,
             tab_area: zero_rect,
         };
@@ -140,34 +199,213 @@ impl App {
         self.tasks
             .iter()
             .filter(|tv| self.active_tab.filter(tv.task.status))
+            .filter(|tv| match &self.tag_filter {
+                None => true,
+                Some(tag) => tv.task.tags.contains(tag),
+            })
             .collect()
     }
 
-    fn selected_task_view(&self) -> Option<&TaskView> {
-        let filtered = self.filtered_tasks();
-        self.table_state
-            .selected()
-            .and_then(|i| filtered.get(i).copied())
+    // ── Tree helpers ────────────────────────────────────────────────────────
+
+    /// Build a map from parent_id -> list of child indices into self.tasks.
+    fn children_map(&self) -> HashMap<Option<i64>, Vec<usize>> {
+        let mut map: HashMap<Option<i64>, Vec<usize>> = HashMap::new();
+        for (i, tv) in self.tasks.iter().enumerate() {
+            map.entry(tv.task.parent_id).or_default().push(i);
+        }
+        map
     }
+
+    /// Depth-first traversal of the task tree, respecting collapsed state.
+    fn tree_walk(&self) -> Vec<(usize, usize)> {
+        let children = self.children_map();
+        let mut result = Vec::new();
+        let mut visited = HashSet::new();
+
+        fn walk(
+            parent_id: Option<i64>,
+            depth: usize,
+            children: &HashMap<Option<i64>, Vec<usize>>,
+            tasks: &[TaskView],
+            collapsed: &HashSet<i64>,
+            visited: &mut HashSet<i64>,
+            result: &mut Vec<(usize, usize)>,
+        ) {
+            if let Some(kids) = children.get(&parent_id) {
+                for &idx in kids {
+                    let task_id = tasks[idx].task.id;
+                    if !visited.insert(task_id) {
+                        continue; // cycle guard
+                    }
+                    result.push((idx, depth));
+                    if !collapsed.contains(&task_id) {
+                        walk(
+                            Some(task_id),
+                            depth + 1,
+                            children,
+                            tasks,
+                            collapsed,
+                            visited,
+                            result,
+                        );
+                    }
+                }
+            }
+        }
+
+        walk(
+            None,
+            0,
+            &children,
+            &self.tasks,
+            &self.collapsed,
+            &mut visited,
+            &mut result,
+        );
+        result
+    }
+
+    fn has_children(&self, task_id: i64) -> bool {
+        self.tasks
+            .iter()
+            .any(|tv| tv.task.parent_id == Some(task_id))
+    }
+
+    // ── Display rows ────────────────────────────────────────────────────────
+
+    fn build_display_rows(&self) -> Vec<DisplayRow> {
+        let has_filter = self.active_tab != ActiveTab::All || self.tag_filter.is_some();
+
+        if self.group_by == GroupBy::None {
+            let tree = self.tree_walk();
+            return tree
+                .into_iter()
+                .filter(|(idx, _)| {
+                    let tv = &self.tasks[*idx];
+                    self.active_tab.filter(tv.task.status)
+                        && match &self.tag_filter {
+                            None => true,
+                            Some(tag) => tv.task.tags.contains(tag),
+                        }
+                })
+                .map(|(idx, depth)| DisplayRow::Task {
+                    idx,
+                    // When filters are active, flatten to avoid orphaned children
+                    depth: if has_filter { 0 } else { depth },
+                })
+                .collect();
+        }
+
+        // Grouped view: flat (depth 0) within groups
+        let filtered: Vec<usize> = self
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, tv)| {
+                self.active_tab.filter(tv.task.status)
+                    && match &self.tag_filter {
+                        None => true,
+                        Some(tag) => tv.task.tags.contains(tag),
+                    }
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut group_map: std::collections::BTreeMap<String, Vec<usize>> =
+            std::collections::BTreeMap::new();
+
+        for &idx in &filtered {
+            let task = &self.tasks[idx].task;
+            let keys = match self.group_by {
+                GroupBy::Status => vec![task.status.label().to_string()],
+                GroupBy::Priority => vec![task.priority.label().to_string()],
+                GroupBy::Tag => {
+                    if task.tags.is_empty() {
+                        vec!["untagged".to_string()]
+                    } else {
+                        task.tags.clone()
+                    }
+                }
+                GroupBy::None => unreachable!(),
+            };
+            for key in keys {
+                group_map.entry(key).or_default().push(idx);
+            }
+        }
+
+        let ordered_keys: Vec<String> = match self.group_by {
+            GroupBy::Status => vec!["IN PROGRESS", "TODO", "BLOCKED", "DONE"]
+                .into_iter()
+                .map(String::from)
+                .filter(|k| group_map.contains_key(k))
+                .collect(),
+            GroupBy::Priority => vec!["crit", "high", "med", "low"]
+                .into_iter()
+                .map(String::from)
+                .filter(|k| group_map.contains_key(k))
+                .collect(),
+            _ => group_map.keys().cloned().collect(),
+        };
+
+        let mut rows = Vec::new();
+        for key in ordered_keys {
+            if let Some(indices) = group_map.remove(&key) {
+                rows.push(DisplayRow::Header(key));
+                for idx in indices {
+                    rows.push(DisplayRow::Task { idx, depth: 0 });
+                }
+            }
+        }
+        rows
+    }
+
+    fn selected_task_view(&self) -> Option<&TaskView> {
+        let display = self.build_display_rows();
+        self.table_state.selected().and_then(|i| {
+            display.get(i).and_then(|row| match row {
+                DisplayRow::Task { idx, .. } => Some(&self.tasks[*idx]),
+                DisplayRow::Header(_) => None,
+            })
+        })
+    }
+
+    fn select_first_task(&mut self) {
+        let display = self.build_display_rows();
+        let first = display
+            .iter()
+            .position(|r| matches!(r, DisplayRow::Task { .. }));
+        self.table_state.select(first.or(Some(0)));
+    }
+
+    fn all_tags(&self) -> Vec<String> {
+        let set: BTreeSet<&str> = self
+            .tasks
+            .iter()
+            .flat_map(|tv| tv.task.tags.iter().map(|s| s.as_str()))
+            .collect();
+        set.into_iter().map(String::from).collect()
+    }
+
+    // ── Actions ─────────────────────────────────────────────────────────────
 
     fn delete_selected(&mut self) {
         if let Some(tv) = self.selected_task_view() {
             let id = tv.task.id;
             let _ = self.db.delete_task(id);
+            self.collapsed.remove(&id);
             self.reload_tasks();
-            // Clamp selection
-            let filtered_len = self.filtered_tasks().len();
-            if let Some(i) = self.table_state.selected() {
-                if i >= filtered_len && filtered_len > 0 {
-                    self.table_state.select(Some(filtered_len - 1));
-                } else if filtered_len == 0 {
-                    self.table_state.select(None);
-                }
-            }
+            self.select_first_task();
         }
     }
 
+    // ── Key handling ────────────────────────────────────────────────────────
+
     fn handle_key(&mut self, code: KeyCode) {
+        if self.input_mode {
+            self.handle_input_key(code);
+            return;
+        }
         if self.confirm_delete {
             if code == KeyCode::Char('y') {
                 self.delete_selected();
@@ -175,24 +413,40 @@ impl App {
             self.confirm_delete = false;
             return;
         }
+        if self.show_tag_picker {
+            self.handle_tag_picker_key(code);
+            return;
+        }
         if self.show_help {
             self.show_help = false;
             return;
         }
-        let filtered_len = self.filtered_tasks().len();
+        let display = self.build_display_rows();
+        let display_len = display.len();
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('j') | KeyCode::Down => {
-                if filtered_len > 0 {
-                    let i = self.table_state.selected().unwrap_or(0);
-                    self.table_state.select(Some((i + 1) % filtered_len));
+                if display_len > 0 {
+                    let mut i = self.table_state.selected().unwrap_or(0);
+                    loop {
+                        i = (i + 1) % display_len;
+                        if matches!(display[i], DisplayRow::Task { .. }) {
+                            break;
+                        }
+                    }
+                    self.table_state.select(Some(i));
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if filtered_len > 0 {
-                    let i = self.table_state.selected().unwrap_or(0);
-                    self.table_state
-                        .select(Some(i.checked_sub(1).unwrap_or(filtered_len - 1)));
+                if display_len > 0 {
+                    let mut i = self.table_state.selected().unwrap_or(0);
+                    loop {
+                        i = i.checked_sub(1).unwrap_or(display_len - 1);
+                        if matches!(display[i], DisplayRow::Task { .. }) {
+                            break;
+                        }
+                    }
+                    self.table_state.select(Some(i));
                 }
             }
             KeyCode::Tab => {
@@ -202,7 +456,7 @@ impl App {
                     ActiveTab::Blocked => ActiveTab::Done,
                     ActiveTab::Done => ActiveTab::All,
                 };
-                self.table_state.select(Some(0));
+                self.select_first_task();
             }
             KeyCode::BackTab => {
                 self.active_tab = match self.active_tab {
@@ -211,12 +465,123 @@ impl App {
                     ActiveTab::Blocked => ActiveTab::Active,
                     ActiveTab::Done => ActiveTab::Blocked,
                 };
-                self.table_state.select(Some(0));
+                self.select_first_task();
+            }
+            // Expand
+            KeyCode::Char('l') | KeyCode::Enter => {
+                if let Some(task_id) = self.selected_task_view().map(|tv| tv.task.id) {
+                    self.collapsed.remove(&task_id);
+                }
+            }
+            // Collapse / go to parent
+            KeyCode::Char('h') => {
+                if let Some(tv) = self.selected_task_view() {
+                    let task_id = tv.task.id;
+                    let has_kids = self.has_children(task_id);
+                    if has_kids && !self.collapsed.contains(&task_id) {
+                        self.collapsed.insert(task_id);
+                    } else if let Some(parent_id) = tv.task.parent_id {
+                        // Jump to parent
+                        let display = self.build_display_rows();
+                        if let Some(pos) = display.iter().position(|dr| {
+                            matches!(dr, DisplayRow::Task { idx, .. }
+                                if self.tasks[*idx].task.id == parent_id)
+                        }) {
+                            self.table_state.select(Some(pos));
+                        }
+                    }
+                }
+            }
+            // Expand all
+            KeyCode::Char('L') => {
+                self.collapsed.clear();
+            }
+            // Collapse all
+            KeyCode::Char('H') => {
+                let children = self.children_map();
+                for tv in &self.tasks {
+                    if children
+                        .get(&Some(tv.task.id))
+                        .map_or(false, |c| !c.is_empty())
+                    {
+                        self.collapsed.insert(tv.task.id);
+                    }
+                }
+                self.select_first_task();
+            }
+            // Indent: reparent under previous sibling
+            KeyCode::Char('>') => {
+                if let Some(tv) = self.selected_task_view() {
+                    let task_id = tv.task.id;
+                    let current_parent = tv.task.parent_id;
+                    // Find the previous sibling in task list order
+                    let my_pos = self.tasks.iter().position(|t| t.task.id == task_id);
+                    if let Some(my_pos) = my_pos {
+                        let prev_sibling = self
+                            .tasks
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, t)| {
+                                *i < my_pos
+                                    && t.task.parent_id == current_parent
+                                    && t.task.id != task_id
+                            })
+                            .last();
+                        if let Some((_, prev_tv)) = prev_sibling {
+                            let new_parent_id = prev_tv.task.id;
+                            let _ = self.db.reparent_task(task_id, Some(new_parent_id));
+                            self.collapsed.remove(&new_parent_id);
+                            self.reload_tasks();
+                        }
+                    }
+                }
+            }
+            // Outdent: move to grandparent level
+            KeyCode::Char('<') => {
+                if let Some(tv) = self.selected_task_view() {
+                    let task_id = tv.task.id;
+                    if let Some(parent_id) = tv.task.parent_id {
+                        // Find grandparent
+                        let grandparent = self
+                            .tasks
+                            .iter()
+                            .find(|t| t.task.id == parent_id)
+                            .and_then(|t| t.task.parent_id);
+                        let _ = self.db.reparent_task(task_id, grandparent);
+                        self.reload_tasks();
+                    }
+                }
+            }
+            KeyCode::Char('g') => {
+                self.group_by = self.group_by.next();
+                self.select_first_task();
+            }
+            KeyCode::Char('t') => {
+                self.show_tag_picker = true;
+                self.tag_picker_state.select(Some(0));
             }
             KeyCode::Char('x') | KeyCode::Delete => {
                 if self.selected_task_view().is_some() {
                     self.confirm_delete = true;
                 }
+            }
+            // Add sibling task (same parent as selected)
+            KeyCode::Char('a') => {
+                let parent_id = self
+                    .selected_task_view()
+                    .and_then(|tv| tv.task.parent_id);
+                self.input_parent_id = parent_id;
+                self.input_buffer.clear();
+                self.input_cursor = 0;
+                self.input_mode = true;
+            }
+            // Add child task (under selected)
+            KeyCode::Char('A') => {
+                let parent_id = self.selected_task_view().map(|tv| tv.task.id);
+                self.input_parent_id = parent_id;
+                self.input_buffer.clear();
+                self.input_cursor = 0;
+                self.input_mode = true;
             }
             KeyCode::Char('d') => self.show_detail = !self.show_detail,
             KeyCode::Char('?') => self.show_help = true,
@@ -224,26 +589,123 @@ impl App {
         }
     }
 
+    fn handle_input_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.input_mode = false;
+                self.input_buffer.clear();
+            }
+            KeyCode::Enter => {
+                let title = self.input_buffer.trim().to_string();
+                if !title.is_empty() {
+                    let _ = self.db.add_task(
+                        &title,
+                        Priority::Medium,
+                        &[],
+                        "",
+                        self.input_parent_id,
+                    );
+                    // Expand parent so the new task is visible
+                    if let Some(pid) = self.input_parent_id {
+                        self.collapsed.remove(&pid);
+                    }
+                    self.reload_tasks();
+                    // Select the newly created task (last task with matching parent)
+                    let display = self.build_display_rows();
+                    if let Some(pos) = display.iter().rposition(|dr| {
+                        matches!(dr, DisplayRow::Task { idx, .. }
+                            if self.tasks[*idx].task.title == title
+                                && self.tasks[*idx].task.parent_id == self.input_parent_id)
+                    }) {
+                        self.table_state.select(Some(pos));
+                    }
+                }
+                self.input_mode = false;
+                self.input_buffer.clear();
+            }
+            KeyCode::Backspace => {
+                if self.input_cursor > 0 {
+                    self.input_cursor -= 1;
+                    self.input_buffer.remove(self.input_cursor);
+                }
+            }
+            KeyCode::Delete => {
+                if self.input_cursor < self.input_buffer.len() {
+                    self.input_buffer.remove(self.input_cursor);
+                }
+            }
+            KeyCode::Left => {
+                if self.input_cursor > 0 {
+                    self.input_cursor -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if self.input_cursor < self.input_buffer.len() {
+                    self.input_cursor += 1;
+                }
+            }
+            KeyCode::Home => self.input_cursor = 0,
+            KeyCode::End => self.input_cursor = self.input_buffer.len(),
+            KeyCode::Char(c) => {
+                self.input_buffer.insert(self.input_cursor, c);
+                self.input_cursor += 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_tag_picker_key(&mut self, code: KeyCode) {
+        let tags = self.all_tags();
+        let item_count = tags.len() + 1;
+        match code {
+            KeyCode::Esc | KeyCode::Char('t') => {
+                self.show_tag_picker = false;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                let i = self.tag_picker_state.selected().unwrap_or(0);
+                self.tag_picker_state.select(Some((i + 1) % item_count));
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                let i = self.tag_picker_state.selected().unwrap_or(0);
+                self.tag_picker_state
+                    .select(Some(i.checked_sub(1).unwrap_or(item_count - 1)));
+            }
+            KeyCode::Enter => {
+                let i = self.tag_picker_state.selected().unwrap_or(0);
+                if i == 0 {
+                    self.tag_filter = None;
+                } else {
+                    self.tag_filter = tags.get(i - 1).cloned();
+                }
+                self.show_tag_picker = false;
+                self.table_state.select(Some(0));
+            }
+            _ => {}
+        }
+    }
+
     fn handle_mouse(&mut self, kind: MouseEventKind, column: u16, row: u16) {
         match kind {
             MouseEventKind::Down(_) => {
-                // Click on table row — select it (header is row 0, data starts at row 1)
-                if row > self.table_area.y && column >= self.table_area.x && column < self.table_area.x + self.table_area.width {
-                    let row_index = (row - self.table_area.y - 1) as usize; // -1 for header
-                    let filtered_len = self.filtered_tasks().len();
-                    if row_index < filtered_len {
+                if row > self.table_area.y
+                    && column >= self.table_area.x
+                    && column < self.table_area.x + self.table_area.width
+                {
+                    let row_index = (row - self.table_area.y - 1) as usize;
+                    let display = self.build_display_rows();
+                    if row_index < display.len()
+                        && matches!(display[row_index], DisplayRow::Task { .. })
+                    {
                         self.table_state.select(Some(row_index));
                     }
                 }
-                // Click on tab area — switch tabs
                 if row >= self.tab_area.y && row < self.tab_area.y + self.tab_area.height {
                     let x = column as usize;
-                    // Approximate tab boundaries based on rendered widths
                     let tab_texts = self.tab_labels();
-                    let mut offset = 1; // leading padding
+                    let mut offset = 1;
                     for (i, label) in tab_texts.iter().enumerate() {
-                        let tab_width = label.len() + 2; // padding
-                        let sep_width = 3; // " │ "
+                        let tab_width = label.len() + 2;
+                        let sep_width = 3;
                         if x >= offset && x < offset + tab_width {
                             self.active_tab = match i {
                                 0 => ActiveTab::All,
@@ -252,7 +714,7 @@ impl App {
                                 3 => ActiveTab::Done,
                                 _ => self.active_tab,
                             };
-                            self.table_state.select(Some(0));
+                            self.select_first_task();
                             break;
                         }
                         offset += tab_width + sep_width;
@@ -260,18 +722,29 @@ impl App {
                 }
             }
             MouseEventKind::ScrollUp => {
-                let filtered_len = self.filtered_tasks().len();
-                if filtered_len > 0 {
-                    let i = self.table_state.selected().unwrap_or(0);
-                    self.table_state
-                        .select(Some(i.checked_sub(1).unwrap_or(filtered_len - 1)));
+                let display = self.build_display_rows();
+                if !display.is_empty() {
+                    let mut i = self.table_state.selected().unwrap_or(0);
+                    loop {
+                        i = i.checked_sub(1).unwrap_or(display.len() - 1);
+                        if matches!(display[i], DisplayRow::Task { .. }) {
+                            break;
+                        }
+                    }
+                    self.table_state.select(Some(i));
                 }
             }
             MouseEventKind::ScrollDown => {
-                let filtered_len = self.filtered_tasks().len();
-                if filtered_len > 0 {
-                    let i = self.table_state.selected().unwrap_or(0);
-                    self.table_state.select(Some((i + 1) % filtered_len));
+                let display = self.build_display_rows();
+                if !display.is_empty() {
+                    let mut i = self.table_state.selected().unwrap_or(0);
+                    loop {
+                        i = (i + 1) % display.len();
+                        if matches!(display[i], DisplayRow::Task { .. }) {
+                            break;
+                        }
+                    }
+                    self.table_state.select(Some(i));
                 }
             }
             _ => {}
@@ -285,7 +758,9 @@ impl App {
                 "Active ({})",
                 self.tasks
                     .iter()
-                    .filter(|tv| tv.task.status == Status::InProgress || tv.task.status == Status::Todo)
+                    .filter(
+                        |tv| tv.task.status == Status::InProgress || tv.task.status == Status::Todo
+                    )
                     .count()
             ),
             format!(
@@ -320,10 +795,14 @@ fn ui(f: &mut Frame, app: &mut App) {
         .split(f.area());
 
     app.tab_area = outer[1];
-    render_header(f, outer[0]);
+    render_header(f, outer[0], app);
     render_tabs(f, outer[1], app);
     render_body(f, outer[2], app);
-    render_status_bar(f, outer[3], app);
+    if app.input_mode {
+        render_input_bar(f, outer[3], app);
+    } else {
+        render_status_bar(f, outer[3], app);
+    }
 
     if app.show_help {
         render_help_popup(f);
@@ -331,19 +810,46 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.confirm_delete {
         render_delete_confirm(f, app);
     }
+    if app.show_tag_picker {
+        render_tag_picker(f, app);
+    }
 }
 
-fn render_header(f: &mut Frame, area: ratatui::layout::Rect) {
-    let title = vec![
+fn render_header(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let mut title = vec![
         Span::styled("  cli", Style::default().fg(Color::Cyan).bold()),
         Span::styled("-", Style::default().fg(Color::DarkGray)),
         Span::styled("todo", Style::default().fg(Color::White).bold()),
         Span::styled("  ", Style::default()),
         Span::styled(
-            "task tracker for developers",
+            "developer control plane",
             Style::default().fg(Color::DarkGray),
         ),
     ];
+    if app.group_by != GroupBy::None {
+        title.push(Span::styled(
+            "  group: ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        title.push(Span::styled(
+            format!(" {} ", app.group_by.label()),
+            Style::default()
+                .fg(Color::Cyan)
+                .bg(Color::Rgb(20, 40, 50)),
+        ));
+    }
+    if let Some(tag) = &app.tag_filter {
+        title.push(Span::styled(
+            "  filter: ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        title.push(Span::styled(
+            format!(" {} ", tag),
+            Style::default()
+                .fg(Color::Cyan)
+                .bg(Color::Rgb(20, 40, 50)),
+        ));
+    }
     let header = Paragraph::new(Line::from(title)).block(
         Block::default()
             .borders(Borders::BOTTOM)
@@ -361,7 +867,9 @@ fn render_tabs(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             " Active ({}) ",
             app.tasks
                 .iter()
-                .filter(|tv| tv.task.status == Status::InProgress || tv.task.status == Status::Todo)
+                .filter(
+                    |tv| tv.task.status == Status::InProgress || tv.task.status == Status::Todo
+                )
                 .count()
         ),
         format!(
@@ -387,7 +895,10 @@ fn render_tabs(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         .select(app.active_tab.index())
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(Style::default().fg(Color::Cyan).bold())
-        .divider(Span::styled(" │ ", Style::default().fg(Color::DarkGray)))
+        .divider(Span::styled(
+            " │ ",
+            Style::default().fg(Color::DarkGray),
+        ))
         .padding(" ", " ");
 
     f.render_widget(tabs, area);
@@ -408,13 +919,57 @@ fn render_body(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     }
 }
 
-fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    let filtered: Vec<&TaskView> = app
-        .tasks
+/// Compute tree-line prefix for a task row at a given position in the display list.
+fn tree_prefix(display: &[DisplayRow], row_index: usize) -> String {
+    let depth = match &display[row_index] {
+        DisplayRow::Task { depth, .. } => *depth,
+        _ => return String::new(),
+    };
+    if depth == 0 {
+        return String::new();
+    }
+
+    let mut prefix = String::new();
+
+    // For each ancestor depth level (1..depth-1), check if there's a subsequent
+    // sibling at that depth, meaning we need a │ connector.
+    for d in 1..depth {
+        let has_future_sibling = display[row_index + 1..]
+            .iter()
+            .take_while(|r| match r {
+                DisplayRow::Task { depth: rd, .. } => *rd >= d,
+                DisplayRow::Header(_) => true,
+            })
+            .any(|r| matches!(r, DisplayRow::Task { depth: rd, .. } if *rd == d));
+        if has_future_sibling {
+            prefix.push_str("│  ");
+        } else {
+            prefix.push_str("   ");
+        }
+    }
+
+    // Check if this is the last child at its depth level
+    let is_last = !display[row_index + 1..]
         .iter()
-        .filter(|tv| app.active_tab.filter(tv.task.status))
-        .collect();
-    let filtered_len = filtered.len();
+        .take_while(|r| match r {
+            DisplayRow::Task { depth: rd, .. } => *rd >= depth,
+            DisplayRow::Header(_) => true,
+        })
+        .any(|r| matches!(r, DisplayRow::Task { depth: rd, .. } if *rd == depth));
+
+    if is_last {
+        prefix.push_str("└─ ");
+    } else {
+        prefix.push_str("├─ ");
+    }
+
+    prefix
+}
+
+fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
+    let display = app.build_display_rows();
+    let display_len = display.len();
+    let children_map = app.children_map();
 
     let header = Row::new(vec![
         Cell::from(" "),
@@ -430,48 +985,86 @@ fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
     )
     .height(1);
 
-    let rows: Vec<Row> = filtered
+    let rows: Vec<Row> = display
         .iter()
-        .map(|tv| {
-            let task = &tv.task;
-            let status_cell = Cell::from(Span::styled(
-                status_icon(task.status),
-                Style::default().fg(status_color(task.status)),
-            ));
-            let title_cell = Cell::from(Span::styled(
-                task.title.as_str(),
-                Style::default().fg(Color::White),
-            ));
-            let priority_cell = Cell::from(Span::styled(
-                task.priority.label(),
-                Style::default().fg(priority_color(task.priority)),
-            ));
-            let tags_cell = Cell::from(Span::styled(
-                task.tags.join(", "),
-                Style::default().fg(Color::DarkGray),
-            ));
-            let session_count = if tv.session_count == 0 {
-                String::from("—")
-            } else {
-                format!("{}", tv.session_count)
-            };
-            let session_cell = Cell::from(Span::styled(
-                session_count,
-                if tv.session_count == 0 {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default().fg(Color::Magenta)
-                },
-            ));
+        .enumerate()
+        .map(|(i, dr)| match dr {
+            DisplayRow::Header(label) => {
+                let header_text = format!("── {} ──", label);
+                Row::new(vec![
+                    Cell::from(""),
+                    Cell::from(Span::styled(
+                        header_text,
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                ])
+                .height(1)
+            }
+            DisplayRow::Task { idx, .. } => {
+                let tv = &app.tasks[*idx];
+                let task = &tv.task;
 
-            Row::new(vec![
-                status_cell,
-                title_cell,
-                priority_cell,
-                tags_cell,
-                session_cell,
-            ])
-            .height(1)
+                let status_cell = Cell::from(Span::styled(
+                    status_icon(task.status),
+                    Style::default().fg(status_color(task.status)),
+                ));
+
+                // Build title with tree prefix and collapse indicator
+                let prefix = tree_prefix(&display, i);
+                let has_kids = children_map
+                    .get(&Some(task.id))
+                    .map_or(false, |c| !c.is_empty());
+                let collapse_ind = if has_kids {
+                    if app.collapsed.contains(&task.id) {
+                        "▸ "
+                    } else {
+                        "▾ "
+                    }
+                } else {
+                    "  "
+                };
+                let title_text = format!("{}{}{}", prefix, collapse_ind, task.title);
+                let title_cell = Cell::from(Span::styled(
+                    title_text,
+                    Style::default().fg(Color::White),
+                ));
+
+                let priority_cell = Cell::from(Span::styled(
+                    task.priority.label(),
+                    Style::default().fg(priority_color(task.priority)),
+                ));
+                let tags_cell = Cell::from(Span::styled(
+                    task.tags.join(", "),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                let session_count = if tv.session_count == 0 {
+                    String::from("—")
+                } else {
+                    format!("{}", tv.session_count)
+                };
+                let session_cell = Cell::from(Span::styled(
+                    session_count,
+                    if tv.session_count == 0 {
+                        Style::default().fg(Color::DarkGray)
+                    } else {
+                        Style::default().fg(Color::Magenta)
+                    },
+                ));
+
+                Row::new(vec![
+                    status_cell,
+                    title_cell,
+                    priority_cell,
+                    tags_cell,
+                    session_cell,
+                ])
+                .height(1)
+            }
         })
         .collect();
 
@@ -499,7 +1092,7 @@ fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
             .add_modifier(Modifier::BOLD),
     );
 
-    let mut scrollbar_state = ScrollbarState::new(filtered_len.saturating_sub(1))
+    let mut scrollbar_state = ScrollbarState::new(display_len.saturating_sub(1))
         .position(app.table_state.selected().unwrap_or(0));
 
     f.render_stateful_widget(table, area, &mut app.table_state);
@@ -536,6 +1129,27 @@ fn render_detail_panel(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     )));
     lines.push(Line::from(""));
 
+    // Breadcrumb path
+    if task.parent_id.is_some() {
+        let mut crumbs: Vec<String> = Vec::new();
+        let mut current_parent = task.parent_id;
+        while let Some(pid) = current_parent {
+            if let Some(parent_tv) = app.tasks.iter().find(|tv| tv.task.id == pid) {
+                crumbs.push(parent_tv.task.title.clone());
+                current_parent = parent_tv.task.parent_id;
+            } else {
+                break;
+            }
+        }
+        crumbs.reverse();
+        let breadcrumb = crumbs.join(" > ");
+        lines.push(Line::from(vec![
+            Span::styled("path   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(breadcrumb, Style::default().fg(Color::DarkGray).italic()),
+        ]));
+        lines.push(Line::from(""));
+    }
+
     // Status + Priority row
     lines.push(Line::from(vec![
         Span::styled("status ", Style::default().fg(Color::DarkGray)),
@@ -570,15 +1184,44 @@ fn render_detail_panel(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     }
 
     // Description
-    lines.push(Line::from(Span::styled(
-        "description",
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines.push(Line::from(Span::styled(
-        &task.description,
-        Style::default().fg(Color::White),
-    )));
-    lines.push(Line::from(""));
+    if !task.description.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "description",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            &task.description,
+            Style::default().fg(Color::White),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    // Subtasks
+    let children: Vec<&TaskView> = app
+        .tasks
+        .iter()
+        .filter(|tv| tv.task.parent_id == Some(task.id))
+        .collect();
+    if !children.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("subtasks ({})", children.len()),
+            Style::default().fg(Color::DarkGray),
+        )));
+        for child in &children {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    status_icon(child.task.status),
+                    Style::default().fg(status_color(child.task.status)),
+                ),
+                Span::styled(
+                    format!(" {}", child.task.title),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
 
     // Claude sessions
     lines.push(Line::from(Span::styled(
@@ -622,7 +1265,15 @@ fn render_status_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .bg(Color::DarkGray)
                 .bold(),
         ),
-        Span::styled(" navigate ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" nav ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            " h/l ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::DarkGray)
+                .bold(),
+        ),
+        Span::styled(" tree ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             " tab ",
             Style::default()
@@ -630,7 +1281,31 @@ fn render_status_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .bg(Color::DarkGray)
                 .bold(),
         ),
-        Span::styled(" filter ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" status ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            " t ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::DarkGray)
+                .bold(),
+        ),
+        Span::styled(" tag ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            " g ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::DarkGray)
+                .bold(),
+        ),
+        Span::styled(" group ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            " a ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::DarkGray)
+                .bold(),
+        ),
+        Span::styled(" add ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             " d ",
             Style::default()
@@ -663,10 +1338,37 @@ fn render_status_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     f.render_widget(Paragraph::new(bar), area);
 }
 
+fn render_input_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let label = if app.input_parent_id.is_some() {
+        "new subtask: "
+    } else {
+        "new task: "
+    };
+    let bar = Line::from(vec![
+        Span::styled(
+            label,
+            Style::default().fg(Color::Cyan).bold(),
+        ),
+        Span::styled(&app.input_buffer, Style::default().fg(Color::White)),
+        Span::styled("█", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "  (Enter to save, Esc to cancel)",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(bar), area);
+    // Place terminal cursor at the input position
+    #[allow(clippy::cast_possible_truncation)]
+    f.set_cursor_position((
+        area.x + label.len() as u16 + app.input_cursor as u16,
+        area.y,
+    ));
+}
+
 fn render_help_popup(f: &mut Frame) {
     let area = f.area();
-    let popup_width = 50u16.min(area.width.saturating_sub(4));
-    let popup_height = 14u16.min(area.height.saturating_sub(4));
+    let popup_width = 54u16.min(area.width.saturating_sub(4));
+    let popup_height = 24u16.min(area.height.saturating_sub(4));
     let popup_area = ratatui::layout::Rect {
         x: (area.width.saturating_sub(popup_width)) / 2,
         y: (area.height.saturating_sub(popup_height)) / 2,
@@ -679,42 +1381,67 @@ fn render_help_popup(f: &mut Frame) {
     let help_text = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("  j / ↓    ", Style::default().fg(Color::Cyan)),
+            Span::styled("  j / ↓      ", Style::default().fg(Color::Cyan)),
             Span::styled("Move down", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
-            Span::styled("  k / ↑    ", Style::default().fg(Color::Cyan)),
+            Span::styled("  k / ↑      ", Style::default().fg(Color::Cyan)),
             Span::styled("Move up", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
-            Span::styled("  Tab      ", Style::default().fg(Color::Cyan)),
-            Span::styled("Next filter tab", Style::default().fg(Color::White)),
+            Span::styled("  l / Enter  ", Style::default().fg(Color::Cyan)),
+            Span::styled("Expand subtasks", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
-            Span::styled("  S-Tab    ", Style::default().fg(Color::Cyan)),
-            Span::styled("Previous filter tab", Style::default().fg(Color::White)),
+            Span::styled("  h          ", Style::default().fg(Color::Cyan)),
+            Span::styled("Collapse / go to parent", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
-            Span::styled("  d        ", Style::default().fg(Color::Cyan)),
+            Span::styled("  L          ", Style::default().fg(Color::Cyan)),
+            Span::styled("Expand all", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  H          ", Style::default().fg(Color::Cyan)),
+            Span::styled("Collapse all", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  > / <      ", Style::default().fg(Color::Cyan)),
+            Span::styled("Indent / outdent (reparent)", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Tab        ", Style::default().fg(Color::Cyan)),
+            Span::styled("Next status tab", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  S-Tab      ", Style::default().fg(Color::Cyan)),
+            Span::styled("Previous status tab", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  g          ", Style::default().fg(Color::Cyan)),
+            Span::styled("Cycle group-by", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  t          ", Style::default().fg(Color::Cyan)),
+            Span::styled("Filter by tag", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  a          ", Style::default().fg(Color::Cyan)),
+            Span::styled("Add sibling task", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  A          ", Style::default().fg(Color::Cyan)),
+            Span::styled("Add child task", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  x          ", Style::default().fg(Color::Cyan)),
+            Span::styled("Delete task", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  d          ", Style::default().fg(Color::Cyan)),
             Span::styled("Toggle detail panel", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
-            Span::styled("  Enter    ", Style::default().fg(Color::Cyan)),
-            Span::styled("Open task (todo)", Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  a        ", Style::default().fg(Color::Cyan)),
-            Span::styled("Add task (todo)", Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::from(vec![
-            Span::styled("  s        ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                "Start Claude session (todo)",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  q / Esc  ", Style::default().fg(Color::Cyan)),
+            Span::styled("  q / Esc    ", Style::default().fg(Color::Cyan)),
             Span::styled("Quit", Style::default().fg(Color::White)),
         ]),
         Line::from(""),
@@ -735,14 +1462,78 @@ fn render_help_popup(f: &mut Frame) {
     f.render_widget(help, popup_area);
 }
 
+fn render_tag_picker(f: &mut Frame, app: &mut App) {
+    let tags = app.all_tags();
+    let item_count = tags.len() + 1;
+    let area = f.area();
+    let popup_height = (item_count as u16 + 3).min(area.height.saturating_sub(4));
+    let popup_width = 30u16.min(area.width.saturating_sub(4));
+    let popup_area = ratatui::layout::Rect {
+        x: (area.width.saturating_sub(popup_width)) / 2,
+        y: (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    f.render_widget(Clear, popup_area);
+
+    let mut rows: Vec<Row> = vec![{
+        let label = if app.tag_filter.is_none() {
+            "  * All tags"
+        } else {
+            "    All tags"
+        };
+        Row::new(vec![Cell::from(Span::styled(
+            label,
+            Style::default().fg(Color::White),
+        ))])
+    }];
+
+    for tag in &tags {
+        let is_active = app.tag_filter.as_ref() == Some(tag);
+        let prefix = if is_active { "  * " } else { "    " };
+        rows.push(Row::new(vec![Cell::from(Span::styled(
+            format!("{}{}", prefix, tag),
+            if is_active {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::White)
+            },
+        ))]));
+    }
+
+    let table = Table::new(rows, [Constraint::Min(1)])
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    " Filter by tag ",
+                    Style::default().fg(Color::Cyan).bold(),
+                ))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan))
+                .style(Style::default().bg(Color::Rgb(15, 15, 25))),
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(30, 40, 55))
+                .add_modifier(Modifier::BOLD),
+        );
+
+    f.render_stateful_widget(table, popup_area, &mut app.tag_picker_state);
+}
+
 fn render_delete_confirm(f: &mut Frame, app: &App) {
-    let title = app
+    let (title, desc_count) = app
         .selected_task_view()
-        .map(|tv| tv.task.title.as_str())
-        .unwrap_or("this task");
+        .map(|tv| {
+            let count = app.db.descendant_count(tv.task.id).unwrap_or(0);
+            (tv.task.title.as_str(), count)
+        })
+        .unwrap_or(("this task", 0));
 
     let area = f.area();
-    let popup_width = 50u16.min(area.width.saturating_sub(4));
+    let popup_width = 55u16.min(area.width.saturating_sub(4));
     let popup_height = 5u16;
     let popup_area = ratatui::layout::Rect {
         x: (area.width.saturating_sub(popup_width)) / 2,
@@ -754,23 +1545,36 @@ fn render_delete_confirm(f: &mut Frame, app: &App) {
     f.render_widget(Clear, popup_area);
 
     let mut display_title = title.to_string();
-    let max_len = (popup_width as usize).saturating_sub(6);
+    let max_len = (popup_width as usize).saturating_sub(10);
     if display_title.len() > max_len {
         display_title.truncate(max_len.saturating_sub(3));
         display_title.push_str("...");
     }
 
+    let delete_msg = if desc_count > 0 {
+        format!(
+            "  Delete {} and {} subtask{}?",
+            display_title,
+            desc_count,
+            if desc_count == 1 { "" } else { "s" }
+        )
+    } else {
+        format!("  Delete {}?", display_title)
+    };
+
     let text = vec![
         Line::from(""),
-        Line::from(vec![
-            Span::styled("  Delete ", Style::default().fg(Color::Red)),
-            Span::styled(display_title, Style::default().fg(Color::White).bold()),
-            Span::styled("?", Style::default().fg(Color::Red)),
-        ]),
+        Line::from(Span::styled(
+            delete_msg,
+            Style::default().fg(Color::Red),
+        )),
         Line::from(vec![
             Span::styled("  Press ", Style::default().fg(Color::DarkGray)),
             Span::styled("y", Style::default().fg(Color::Red).bold()),
-            Span::styled(" to confirm, any other key to cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                " to confirm, any other key to cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
         ]),
     ];
 
