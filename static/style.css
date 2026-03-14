@@ -177,6 +177,7 @@ header h1 {
 
 .status-todo       { color: #666; }
 .status-in_progress { color: #f0c040; }
+.status-in_review  { color: #ce59e6; }
 .status-done       { color: #4caf50; }
 .status-blocked    { color: #f44336; }
 

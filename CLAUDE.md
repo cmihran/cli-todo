@@ -45,7 +45,7 @@ tasks:
   id          INTEGER PRIMARY KEY AUTOINCREMENT
   parent_id   INTEGER REFERENCES tasks(id) ON DELETE CASCADE  -- nullable, enables nesting
   title       TEXT NOT NULL
-  status      TEXT NOT NULL DEFAULT 'todo'        -- todo | in_progress | done | blocked
+  status      TEXT NOT NULL DEFAULT 'todo'        -- todo | in_progress | in_review | done | blocked
   priority    TEXT NOT NULL DEFAULT 'medium'      -- low | medium | high | critical
   tags        TEXT NOT NULL DEFAULT ''             -- comma-separated
   description TEXT NOT NULL DEFAULT ''

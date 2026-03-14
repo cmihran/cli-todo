@@ -2,8 +2,8 @@
   'use strict';
 
   const API = '/api/tasks';
-  const statusIcons = { todo: '\u25CB', in_progress: '\u25D0', done: '\u25CF', blocked: '\u2715' };
-  const statusOrder = ['todo', 'in_progress', 'done', 'blocked'];
+  const statusIcons = { todo: '\u25CB', in_progress: '\u25D0', in_review: '\u25D1', done: '\u25CF', blocked: '\u2715' };
+  const statusOrder = ['todo', 'in_progress', 'in_review', 'done', 'blocked'];
   const priorityLabels = { low: 'low', medium: 'med', high: 'high', critical: 'crit' };
 
   let tasks = [];
@@ -30,7 +30,7 @@
 
   async function cycleStatus(id, currentStatus) {
     const idx = statusOrder.indexOf(currentStatus);
-    const next = statusOrder[(idx + 1) % 3]; // cycle todo → in_progress → done → todo (skip blocked)
+    const next = statusOrder[(idx + 1) % 4]; // cycle todo → in_progress → in_review → done → todo (skip blocked)
     await fetch(`${API}/${id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },

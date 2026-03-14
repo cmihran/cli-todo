@@ -81,8 +81,8 @@ fn tool_schema() -> Value {
                     "properties": {
                         "status": {
                             "type": "string",
-                            "enum": ["todo", "in_progress", "done", "blocked"],
-                            "description": "Filter to tasks with this status"
+                            "enum": ["todo", "in_progress", "in_review", "done", "blocked"],
+                            "description": "Filter by status. Lifecycle: todo → in_progress → in_review (completed in worktree) → done (merged to main)"
                         },
                         "parent_id": {
                             "type": "integer",
@@ -135,8 +135,8 @@ fn tool_schema() -> Value {
                         "title": { "type": "string", "description": "New title" },
                         "status": {
                             "type": "string",
-                            "enum": ["todo", "in_progress", "done", "blocked"],
-                            "description": "New status"
+                            "enum": ["todo", "in_progress", "in_review", "done", "blocked"],
+                            "description": "New status. Use in_review when changes are ready for review in a worktree, done when merged to main"
                         },
                         "priority": {
                             "type": "string",
