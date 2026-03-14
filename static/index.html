@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>cli-todo</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>cli-todo</h1>
+    <form id="add-form">
+      <input type="text" id="add-input" placeholder="Add a task..." autocomplete="off">
+      <select id="add-priority">
+        <option value="low">low</option>
+        <option value="medium" selected>med</option>
+        <option value="high">high</option>
+        <option value="critical">crit</option>
+      </select>
+      <button type="submit">Add</button>
+    </form>
+  </header>
+  <div id="task-list"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

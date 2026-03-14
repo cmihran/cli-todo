@@ -8,16 +8,18 @@ Terminal-native developer control plane built with Rust + Ratatui.
 cargo build          # Compile
 cargo run            # Run TUI (creates DB on first run)
 cargo run -- mcp     # Run MCP server (JSON-RPC over stdio)
+cargo run -- serve   # Run web UI (default http://localhost:3000, override with PORT env var)
 cargo watch -x run   # Auto-reload on code changes (requires cargo-watch)
 ```
 
 ## Architecture
 
-Three-file app with Elm-like architecture:
+Four-file app with Elm-like architecture:
 
 - `src/main.rs` — TUI app: state (`App` struct), input handling (`handle_key`/`handle_mouse`), rendering (`ui()`)
 - `src/db.rs` — SQLite layer: schema, migrations, CRUD, tree queries (recursive CTEs)
 - `src/mcp.rs` — MCP server: JSON-RPC over stdio, exposes task CRUD to Claude Code
+- `src/web.rs` — Web UI: Axum server, JSON API, rust-embed static files (`static/` dir baked into binary)
 
 ## Key Patterns
 
@@ -79,4 +81,5 @@ Run `cli-todo mcp` (or `cargo run -- mcp`) to start a JSON-RPC/MCP server on std
 - **TUI:** Ratatui + Crossterm
 - **Storage:** SQLite via rusqlite (bundled)
 - **MCP server:** Built-in (`cargo run -- mcp`), JSON-RPC over stdio
+- **Web UI:** Axum + rust-embed (vanilla JS frontend, no build step)
 - **Embeddings:** TBD

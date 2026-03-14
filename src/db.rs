@@ -100,6 +100,7 @@ pub struct Task {
 
 pub struct Db {
     conn: Connection,
+    pub path: PathBuf,
 }
 
 impl Db {
@@ -110,7 +111,7 @@ impl Db {
         }
         let conn = Connection::open(&path)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        let db = Db { conn };
+        let db = Db { conn, path: path.clone() };
         db.migrate()?;
         Ok(db)
     }

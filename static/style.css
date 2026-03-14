@@ -1,0 +1,198 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: #1a1a2e;
+  color: #e0e0e0;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+header {
+  padding: 16px 24px;
+  border-bottom: 1px solid #2a2a4a;
+  display: flex;
+  align-items: center;
+  gap: 24px;
+}
+
+header h1 {
+  font-size: 18px;
+  font-weight: 600;
+  color: #7c7cf0;
+  white-space: nowrap;
+}
+
+#add-form {
+  display: flex;
+  gap: 8px;
+  flex: 1;
+  max-width: 600px;
+}
+
+#add-input {
+  flex: 1;
+  background: #16162a;
+  border: 1px solid #2a2a4a;
+  color: #e0e0e0;
+  padding: 6px 12px;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 13px;
+}
+
+#add-input:focus { outline: none; border-color: #7c7cf0; }
+
+#add-priority {
+  background: #16162a;
+  border: 1px solid #2a2a4a;
+  color: #e0e0e0;
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 13px;
+}
+
+#add-form button {
+  background: #7c7cf0;
+  color: #1a1a2e;
+  border: none;
+  padding: 6px 16px;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+#add-form button:hover { background: #9a9af5; }
+
+/* ── Task list ─────────────────────────────────────────────────────────── */
+
+#task-list { padding: 8px 0; }
+
+.task-row {
+  display: flex;
+  align-items: center;
+  padding: 6px 24px;
+  gap: 10px;
+  cursor: default;
+  border-bottom: 1px solid #16162a;
+}
+
+.task-row:hover { background: #1e1e36; }
+
+.task-indent { flex-shrink: 0; }
+
+.task-expand {
+  width: 18px;
+  text-align: center;
+  cursor: pointer;
+  color: #666;
+  font-size: 12px;
+  flex-shrink: 0;
+  user-select: none;
+}
+
+.task-expand:hover { color: #aaa; }
+
+.task-status {
+  cursor: pointer;
+  font-size: 16px;
+  flex-shrink: 0;
+  width: 20px;
+  text-align: center;
+  user-select: none;
+}
+
+.task-status:hover { filter: brightness(1.4); }
+
+.task-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-priority {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.task-tags {
+  font-size: 11px;
+  color: #888;
+  flex-shrink: 0;
+}
+
+.task-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+  opacity: 0;
+}
+
+.task-row:hover .task-actions { opacity: 1; }
+
+.task-actions button {
+  background: none;
+  border: 1px solid #333;
+  color: #888;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.task-actions button:hover { border-color: #666; color: #ccc; }
+.task-actions button.delete-btn:hover { border-color: #f44; color: #f44; }
+
+/* ── Inline add subtask ────────────────────────────────────────────────── */
+
+.subtask-form {
+  display: flex;
+  gap: 6px;
+  padding: 4px 24px 4px 0;
+  align-items: center;
+}
+
+.subtask-form input {
+  flex: 1;
+  background: #16162a;
+  border: 1px solid #2a2a4a;
+  color: #e0e0e0;
+  padding: 4px 8px;
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.subtask-form input:focus { outline: none; border-color: #7c7cf0; }
+
+/* ── Status colors ─────────────────────────────────────────────────────── */
+
+.status-todo       { color: #666; }
+.status-in_progress { color: #f0c040; }
+.status-done       { color: #4caf50; }
+.status-blocked    { color: #f44336; }
+
+.title-done { text-decoration: line-through; color: #666; }
+
+/* ── Priority badges ───────────────────────────────────────────────────── */
+
+.priority-low      { color: #666; border: 1px solid #444; }
+.priority-medium   { color: #5c8fff; border: 1px solid #3a5caa; }
+.priority-high     { color: #f0c040; border: 1px solid #9a7a20; }
+.priority-critical { color: #f44336; border: 1px solid #a02020; }
+
+/* ── Empty state ───────────────────────────────────────────────────────── */
+
+.empty-state {
+  text-align: center;
+  padding: 60px 24px;
+  color: #555;
+}

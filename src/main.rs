@@ -1,5 +1,6 @@
 mod db;
 mod mcp;
+mod web;
 
 use crate::db::{Db, Priority, Status, Task};
 use crossterm::{
@@ -1625,9 +1626,10 @@ fn render_delete_confirm(f: &mut Frame, app: &App) {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 fn main() -> io::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("mcp") {
-        mcp::run();
-        return Ok(());
+    match std::env::args().nth(1).as_deref() {
+        Some("mcp") => { mcp::run(); return Ok(()); }
+        Some("serve") => { return web::run(); }
+        _ => {}
     }
 
     let db = Db::open().expect("failed to open database");
@@ -1638,21 +1640,46 @@ fn main() -> io::Result<()> {
     enable_raw_mode()?;
 
     let mut terminal = Terminal::new(ratatui::backend::CrosstermBackend::new(stdout()))?;
+    let db_path = db.path.clone();
     let mut app = App::new(db);
+    let mut last_mtime = std::fs::metadata(&db_path)
+        .and_then(|m| m.modified())
+        .ok();
 
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
 
-        match event::read()? {
-            Event::Key(key) => {
-                if key.kind == KeyEventKind::Press {
-                    app.handle_key(key.code);
+        if event::poll(std::time::Duration::from_secs(1))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Press {
+                        app.handle_key(key.code);
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    app.handle_mouse(mouse.kind, mouse.column, mouse.row);
+                }
+                _ => {}
+            }
+        }
+
+        // Reload if DB was modified externally
+        let current_mtime = std::fs::metadata(&db_path)
+            .and_then(|m| m.modified())
+            .ok();
+        if current_mtime != last_mtime {
+            last_mtime = current_mtime;
+            let selected_id = app.selected_task_view().map(|tv| tv.task.id);
+            app.reload_tasks();
+            // Restore selection by task ID
+            if let Some(id) = selected_id {
+                let display = app.build_display_rows();
+                if let Some(pos) = display.iter().position(|dr| {
+                    matches!(dr, DisplayRow::Task { idx, .. } if app.tasks[*idx].task.id == id)
+                }) {
+                    app.table_state.select(Some(pos));
                 }
             }
-            Event::Mouse(mouse) => {
-                app.handle_mouse(mouse.kind, mouse.column, mouse.row);
-            }
-            _ => {}
         }
 
         if app.quit {
