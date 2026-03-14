@@ -36,10 +36,12 @@ fn status_color(s: Status) -> Color {
     }
 }
 
-fn status_icon(s: Status) -> &'static str {
+const IN_PROGRESS_FRAMES: &[&str] = &["◐", "◓", "◑", "◒"];
+
+fn status_icon(s: Status, tick: usize) -> &'static str {
     match s {
         Status::Todo => "○",
-        Status::InProgress => "◐",
+        Status::InProgress => IN_PROGRESS_FRAMES[tick % IN_PROGRESS_FRAMES.len()],
         Status::Done => "●",
         Status::Blocked => "✕",
     }
@@ -231,6 +233,9 @@ struct App {
     claude_picker_state: TableState,
     // Active Claude session IDs (detected from running processes)
     active_session_ids: HashSet<String>,
+    // Animation tick counter for spinner effects
+    animation_tick: usize,
+    last_animation: std::time::Instant,
 }
 
 // ── App logic ───────────────────────────────────────────────────────────────
@@ -283,6 +288,8 @@ impl App {
             },
             claude_pane_area: zero_rect,
             active_session_ids: HashSet::new(),
+            animation_tick: 0,
+            last_animation: std::time::Instant::now(),
         };
         app.reload_tasks();
         app.refresh_active_sessions();
@@ -1493,7 +1500,7 @@ fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
                 let task = &tv.task;
 
                 let status_cell = Cell::from(Span::styled(
-                    status_icon(task.status),
+                    status_icon(task.status, app.animation_tick),
                     Style::default().fg(status_color(task.status)),
                 ));
 
@@ -1640,7 +1647,7 @@ fn render_detail_panel(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     lines.push(Line::from(vec![
         Span::styled("status ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("{} {}", status_icon(task.status), task.status.label()),
+            format!("{} {}", status_icon(task.status, app.animation_tick), task.status.label()),
             Style::default().fg(status_color(task.status)),
         ),
         Span::styled("   priority ", Style::default().fg(Color::DarkGray)),
@@ -1697,7 +1704,7 @@ fn render_detail_panel(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             lines.push(Line::from(vec![
                 Span::styled("  ", Style::default()),
                 Span::styled(
-                    status_icon(child.task.status),
+                    status_icon(child.task.status, app.animation_tick),
                     Style::default().fg(status_color(child.task.status)),
                 ),
                 Span::styled(
@@ -2347,9 +2354,19 @@ fn main() -> io::Result<()> {
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
 
-        // Faster refresh when any Claude pane is active for smooth rendering
+        // Advance animation tick every 250ms for spinning status icons
+        if app.last_animation.elapsed() >= std::time::Duration::from_millis(250) {
+            app.animation_tick = app.animation_tick.wrapping_add(1);
+            app.last_animation = std::time::Instant::now();
+        }
+
+        // Faster refresh when any Claude pane is active for smooth rendering,
+        // or when we have in-progress tasks that need animation
+        let has_in_progress = app.tasks.iter().any(|tv| tv.task.status == Status::InProgress);
         let poll_timeout = if !app.claude_panes.is_empty() {
             std::time::Duration::from_millis(16)
+        } else if has_in_progress {
+            std::time::Duration::from_millis(250)
         } else {
             std::time::Duration::from_secs(1)
         };
