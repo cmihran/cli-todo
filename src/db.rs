@@ -153,6 +153,18 @@ impl Db {
             "CREATE INDEX IF NOT EXISTS idx_tasks_parent_id ON tasks(parent_id);",
         )?;
 
+        // Migration: add position for manual ordering
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE tasks ADD COLUMN position INTEGER NOT NULL DEFAULT 0;",
+        );
+        // Backfill: assign positions based on current id order within each sibling group
+        self.conn.execute_batch(
+            "UPDATE tasks SET position = (
+                SELECT COUNT(*) FROM tasks t2
+                WHERE t2.parent_id IS tasks.parent_id AND t2.id < tasks.id
+            ) WHERE position = 0;",
+        )?;
+
         Ok(())
     }
 
@@ -186,7 +198,7 @@ impl Db {
 
     pub fn all_tasks(&self) -> rusqlite::Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, parent_id, title, status, priority, tags, description FROM tasks ORDER BY parent_id NULLS FIRST, CASE status WHEN 'done' THEN 0 WHEN 'in_progress' THEN 1 WHEN 'todo' THEN 2 WHEN 'blocked' THEN 3 END, id",
+            "SELECT id, parent_id, title, status, priority, tags, description FROM tasks ORDER BY parent_id NULLS FIRST, position, id",
         )?;
         let tasks = stmt
             .query_map([], |row| {
@@ -251,9 +263,14 @@ impl Db {
         parent_id: Option<i64>,
     ) -> rusqlite::Result<i64> {
         let tags_str = tags.join(",");
+        let next_pos: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM tasks WHERE parent_id IS ?1",
+            params![parent_id],
+            |row| row.get(0),
+        )?;
         self.conn.execute(
-            "INSERT INTO tasks (title, priority, tags, description, parent_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![title, priority.as_str(), tags_str, description, parent_id],
+            "INSERT INTO tasks (title, priority, tags, description, parent_id, position) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![title, priority.as_str(), tags_str, description, parent_id, next_pos],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -309,10 +326,38 @@ impl Db {
         Ok(())
     }
 
-    pub fn reparent_task(&self, task_id: i64, new_parent_id: Option<i64>) -> rusqlite::Result<()> {
+    /// Swap the position of two sibling tasks.
+    pub fn swap_task_order(&self, task_a: i64, task_b: i64) -> rusqlite::Result<()> {
+        let pos_a: i64 = self.conn.query_row(
+            "SELECT position FROM tasks WHERE id = ?1",
+            params![task_a],
+            |row| row.get(0),
+        )?;
+        let pos_b: i64 = self.conn.query_row(
+            "SELECT position FROM tasks WHERE id = ?1",
+            params![task_b],
+            |row| row.get(0),
+        )?;
         self.conn.execute(
-            "UPDATE tasks SET parent_id = ?1, updated_at = datetime('now') WHERE id = ?2",
-            params![new_parent_id, task_id],
+            "UPDATE tasks SET position = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![pos_b, task_a],
+        )?;
+        self.conn.execute(
+            "UPDATE tasks SET position = ?1, updated_at = datetime('now') WHERE id = ?2",
+            params![pos_a, task_b],
+        )?;
+        Ok(())
+    }
+
+    pub fn reparent_task(&self, task_id: i64, new_parent_id: Option<i64>) -> rusqlite::Result<()> {
+        let next_pos: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM tasks WHERE parent_id IS ?1",
+            params![new_parent_id],
+            |row| row.get(0),
+        )?;
+        self.conn.execute(
+            "UPDATE tasks SET parent_id = ?1, position = ?2, updated_at = datetime('now') WHERE id = ?3",
+            params![new_parent_id, next_pos, task_id],
         )?;
         Ok(())
     }

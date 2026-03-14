@@ -130,6 +130,31 @@ impl GroupBy {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum SortBy {
+    Manual,
+    Status,
+    Alphabetical,
+}
+
+impl SortBy {
+    fn label(self) -> &'static str {
+        match self {
+            SortBy::Manual => "manual",
+            SortBy::Status => "status",
+            SortBy::Alphabetical => "A-Z",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            SortBy::Manual => SortBy::Status,
+            SortBy::Status => SortBy::Alphabetical,
+            SortBy::Alphabetical => SortBy::Manual,
+        }
+    }
+}
+
 /// A row in the display list — either a group header or a task reference.
 enum DisplayRow {
     Header(String),
@@ -199,12 +224,14 @@ struct App {
     table_state: TableState,
     active_tab: ActiveTab,
     group_by: GroupBy,
+    sort_by: SortBy,
     tag_filter: Option<String>,
     show_tag_picker: bool,
     tag_picker_state: TableState,
     show_detail: bool,
     show_help: bool,
     confirm_delete: bool,
+    confirm_quit: bool,
     collapsed: HashSet<i64>,
     quit: bool,
     // Inline task creation
@@ -248,12 +275,14 @@ impl App {
             table_state,
             active_tab: ActiveTab::All,
             group_by: GroupBy::None,
+            sort_by: SortBy::Manual,
             tag_filter: None,
             show_tag_picker: false,
             tag_picker_state,
             show_detail: true,
             show_help: false,
             confirm_delete: false,
+            confirm_quit: false,
             collapsed: HashSet::new(),
             quit: false,
             input_mode: false,
@@ -337,11 +366,12 @@ impl App {
         map
     }
 
-    /// Depth-first traversal of the task tree, respecting collapsed state.
+    /// Depth-first traversal of the task tree, respecting collapsed state and sort order.
     fn tree_walk(&self) -> Vec<(usize, usize)> {
         let children = self.children_map();
         let mut result = Vec::new();
         let mut visited = HashSet::new();
+        let sort_by = self.sort_by;
 
         fn walk(
             parent_id: Option<i64>,
@@ -351,9 +381,32 @@ impl App {
             collapsed: &HashSet<i64>,
             visited: &mut HashSet<i64>,
             result: &mut Vec<(usize, usize)>,
+            sort_by: SortBy,
         ) {
             if let Some(kids) = children.get(&parent_id) {
-                for &idx in kids {
+                let sorted: Vec<usize> = match sort_by {
+                    SortBy::Manual => kids.clone(),
+                    SortBy::Status => {
+                        let mut v = kids.clone();
+                        v.sort_by_key(|&idx| {
+                            match tasks[idx].task.status {
+                                Status::InProgress => 0,
+                                Status::Todo => 1,
+                                Status::Blocked => 2,
+                                Status::Done => 3,
+                            }
+                        });
+                        v
+                    }
+                    SortBy::Alphabetical => {
+                        let mut v = kids.clone();
+                        v.sort_by(|&a, &b| {
+                            tasks[a].task.title.to_lowercase().cmp(&tasks[b].task.title.to_lowercase())
+                        });
+                        v
+                    }
+                };
+                for idx in sorted {
                     let task_id = tasks[idx].task.id;
                     if !visited.insert(task_id) {
                         continue; // cycle guard
@@ -368,6 +421,7 @@ impl App {
                             collapsed,
                             visited,
                             result,
+                            sort_by,
                         );
                     }
                 }
@@ -382,6 +436,7 @@ impl App {
             &self.collapsed,
             &mut visited,
             &mut result,
+            sort_by,
         );
         result
     }
@@ -611,6 +666,14 @@ impl App {
             self.handle_edit_picker_key(code);
             return;
         }
+        if self.confirm_quit {
+            if code == KeyCode::Char('y') {
+                self.close_all_claude_panes();
+                self.quit = true;
+            }
+            self.confirm_quit = false;
+            return;
+        }
         if self.confirm_delete {
             if code == KeyCode::Char('y') {
                 self.delete_selected();
@@ -634,17 +697,9 @@ impl App {
         let display_len = display.len();
         match code {
             KeyCode::Char('q') | KeyCode::Esc => {
-                if !self.claude_panes.is_empty() {
-                    // If selected task has an active pane, close just that one
-                    let has_pane = self
-                        .selected_task_id()
-                        .is_some_and(|id| self.claude_panes.contains_key(&id));
-                    if has_pane {
-                        self.close_claude_pane();
-                    } else {
-                        // No pane for current task but others exist — close all
-                        self.close_all_claude_panes();
-                    }
+                let running = self.claude_panes.values().any(|p| !p.exited);
+                if running {
+                    self.confirm_quit = true;
                 } else {
                     self.quit = true;
                 }
@@ -776,6 +831,70 @@ impl App {
                     }
                 }
             }
+            // Move task up among siblings
+            KeyCode::Char('K') => {
+                if let Some(tv) = self.selected_task_view() {
+                    let task_id = tv.task.id;
+                    let parent_id = tv.task.parent_id;
+                    let my_global = self.tasks.iter().position(|t| t.task.id == task_id);
+                    if let Some(my_global) = my_global {
+                        // Find the sibling just before us (same parent, earlier in list)
+                        let prev = self
+                            .tasks
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, t)| {
+                                *i < my_global
+                                    && t.task.parent_id == parent_id
+                                    && t.task.id != task_id
+                            })
+                            .next_back();
+                        if let Some((_, prev_tv)) = prev {
+                            let prev_id = prev_tv.task.id;
+                            let _ = self.db.swap_task_order(task_id, prev_id);
+                            self.reload_tasks();
+                            // Follow the task
+                            let display = self.build_display_rows();
+                            if let Some(pos) = display.iter().position(|dr| {
+                                matches!(dr, DisplayRow::Task { idx, .. } if self.tasks[*idx].task.id == task_id)
+                            }) {
+                                self.table_state.select(Some(pos));
+                            }
+                        }
+                    }
+                }
+            }
+            // Move task down among siblings
+            KeyCode::Char('J') => {
+                if let Some(tv) = self.selected_task_view() {
+                    let task_id = tv.task.id;
+                    let parent_id = tv.task.parent_id;
+                    let my_global = self.tasks.iter().position(|t| t.task.id == task_id);
+                    if let Some(my_global) = my_global {
+                        let next = self
+                            .tasks
+                            .iter()
+                            .enumerate()
+                            .find(|(i, t)| {
+                                *i > my_global
+                                    && t.task.parent_id == parent_id
+                                    && t.task.id != task_id
+                            });
+                        if let Some((_, next_tv)) = next {
+                            let next_id = next_tv.task.id;
+                            let _ = self.db.swap_task_order(task_id, next_id);
+                            self.reload_tasks();
+                            // Follow the task
+                            let display = self.build_display_rows();
+                            if let Some(pos) = display.iter().position(|dr| {
+                                matches!(dr, DisplayRow::Task { idx, .. } if self.tasks[*idx].task.id == task_id)
+                            }) {
+                                self.table_state.select(Some(pos));
+                            }
+                        }
+                    }
+                }
+            }
             KeyCode::Char('s') => {
                 if let Some(id) = self.selected_task_view().map(|tv| tv.task.id) {
                     if let Some(idx) = self.tasks.iter().position(|t| t.task.id == id) {
@@ -802,6 +921,10 @@ impl App {
             }
             KeyCode::Char('g') => {
                 self.group_by = self.group_by.next();
+                self.select_first_task();
+            }
+            KeyCode::Char('o') => {
+                self.sort_by = self.sort_by.next();
                 self.select_first_task();
             }
             KeyCode::Char('t') => {
@@ -837,11 +960,19 @@ impl App {
                     self.edit_picker_state.select(Some(0));
                 }
             }
-            KeyCode::Char('d') => self.show_detail = !self.show_detail,
-            KeyCode::Char('c') => {
-                if self.selected_task_view().is_some() {
-                    self.show_claude_picker = true;
-                    self.claude_picker_state.select(Some(0));
+            KeyCode::Char('d') => {
+                self.show_detail = true;
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                if let Some(task_id) = self.selected_task_id() {
+                    if self.claude_panes.contains_key(&task_id) {
+                        // Running pane exists — just show it
+                        self.show_detail = false;
+                    } else {
+                        // No running pane — open picker to start or resume
+                        self.show_claude_picker = true;
+                        self.claude_picker_state.select(Some(0));
+                    }
                 }
             }
             KeyCode::Char('?') => self.show_help = true,
@@ -1276,6 +1407,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.confirm_delete {
         render_delete_confirm(f, app);
     }
+    if app.confirm_quit {
+        render_quit_confirm(f, app);
+    }
     if app.show_tag_picker {
         render_tag_picker(f, app);
     }
@@ -1305,6 +1439,18 @@ fn render_header(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         ));
         title.push(Span::styled(
             format!(" {} ", app.group_by.label()),
+            Style::default()
+                .fg(Color::Cyan)
+                .bg(Color::Rgb(20, 40, 50)),
+        ));
+    }
+    if app.sort_by != SortBy::Manual {
+        title.push(Span::styled(
+            "  sort: ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        title.push(Span::styled(
+            format!(" {} ", app.sort_by.label()),
             Style::default()
                 .fg(Color::Cyan)
                 .bg(Color::Rgb(20, 40, 50)),
@@ -1377,7 +1523,8 @@ fn render_tabs(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 }
 
 fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
-    if !app.claude_panes.is_empty() {
+    if !app.claude_panes.is_empty() && !app.show_detail {
+        // Claude pane view
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
@@ -1814,26 +1961,26 @@ fn render_status_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 
     let bar = if app.claude_focus {
         Line::from(vec![
-            Span::styled(" F2 ", key_style),
+            Span::styled(" Alt+←/→ ", key_style),
             Span::styled(" focus tasks ", label_style),
-            Span::styled(" q ", key_style),
-            Span::styled(" close Claude ", label_style),
+            Span::styled(" d ", key_style),
+            Span::styled(" detail ", label_style),
             Span::styled(
                 format!("  {} ", pos),
                 label_style,
             ),
         ])
-    } else if !app.claude_panes.is_empty() {
+    } else if !app.claude_panes.is_empty() && !app.show_detail {
         let focus_hint = if has_pane_for_selected {
             " focus Claude "
         } else {
             " focus Claude (no session) "
         };
         Line::from(vec![
-            Span::styled(" F2 ", key_style),
+            Span::styled(" Alt+←/→ ", key_style),
             Span::styled(focus_hint, label_style),
-            Span::styled(" q ", key_style),
-            Span::styled(" close Claude ", label_style),
+            Span::styled(" d ", key_style),
+            Span::styled(" detail ", label_style),
             Span::styled(" j/k ", key_style),
             Span::styled(" nav ", label_style),
             Span::styled(" s ", key_style),
@@ -1857,6 +2004,8 @@ fn render_status_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Span::styled(" tag ", label_style),
             Span::styled(" g ", key_style),
             Span::styled(" group ", label_style),
+            Span::styled(" o ", key_style),
+            Span::styled(" sort ", label_style),
             Span::styled(" a ", key_style),
             Span::styled(" add ", label_style),
             Span::styled(" e ", key_style),
@@ -2015,7 +2164,7 @@ fn render_edit_picker(f: &mut Frame, app: &mut App) {
 fn render_help_popup(f: &mut Frame) {
     let area = f.area();
     let popup_width = 54u16.min(area.width.saturating_sub(4));
-    let popup_height = 29u16.min(area.height.saturating_sub(4));
+    let popup_height = 32u16.min(area.height.saturating_sub(4));
     let popup_area = ratatui::layout::Rect {
         x: (area.width.saturating_sub(popup_width)) / 2,
         y: (area.height.saturating_sub(popup_height)) / 2,
@@ -2056,6 +2205,10 @@ fn render_help_popup(f: &mut Frame) {
             Span::styled("Indent / outdent (reparent)", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
+            Span::styled("  J / K      ", Style::default().fg(Color::Cyan)),
+            Span::styled("Move task down / up", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
             Span::styled("  Tab        ", Style::default().fg(Color::Cyan)),
             Span::styled("Next status tab", Style::default().fg(Color::White)),
         ]),
@@ -2066,6 +2219,10 @@ fn render_help_popup(f: &mut Frame) {
         Line::from(vec![
             Span::styled("  g          ", Style::default().fg(Color::Cyan)),
             Span::styled("Cycle group-by", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  o          ", Style::default().fg(Color::Cyan)),
+            Span::styled("Cycle sort order", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
             Span::styled("  t          ", Style::default().fg(Color::Cyan)),
@@ -2097,19 +2254,23 @@ fn render_help_popup(f: &mut Frame) {
         ]),
         Line::from(vec![
             Span::styled("  d          ", Style::default().fg(Color::Cyan)),
-            Span::styled("Toggle detail panel", Style::default().fg(Color::White)),
+            Span::styled("Show detail panel", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
             Span::styled("  c          ", Style::default().fg(Color::Cyan)),
-            Span::styled("Claude session picker", Style::default().fg(Color::White)),
+            Span::styled("Show/start Claude", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
-            Span::styled("  F2         ", Style::default().fg(Color::Cyan)),
+            Span::styled("  C          ", Style::default().fg(Color::Cyan)),
+            Span::styled("Session picker (resume)", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Alt+←/→    ", Style::default().fg(Color::Cyan)),
             Span::styled("Toggle Claude focus", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
             Span::styled("  q / Esc    ", Style::default().fg(Color::Cyan)),
-            Span::styled("Close Claude / Quit", Style::default().fg(Color::White)),
+            Span::styled("Quit", Style::default().fg(Color::White)),
         ]),
         Line::from(""),
     ];
@@ -2320,6 +2481,52 @@ fn render_delete_confirm(f: &mut Frame, app: &App) {
     f.render_widget(popup, popup_area);
 }
 
+fn render_quit_confirm(f: &mut Frame, app: &App) {
+    let running = app.claude_panes.values().filter(|p| !p.exited).count();
+
+    let area = f.area();
+    let popup_width = 55u16.min(area.width.saturating_sub(4));
+    let popup_height = 5u16;
+    let popup_area = Rect {
+        x: (area.width.saturating_sub(popup_width)) / 2,
+        y: (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    f.render_widget(Clear, popup_area);
+
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "  {} Claude session{} still running — kill and quit?",
+                running,
+                if running == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(Color::Red),
+        )),
+        Line::from(vec![
+            Span::styled("  Press ", Style::default().fg(Color::DarkGray)),
+            Span::styled("y", Style::default().fg(Color::Red).bold()),
+            Span::styled(
+                " to confirm, any other key to cancel",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+    ];
+
+    let popup = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Red))
+            .style(Style::default().bg(Color::Rgb(25, 10, 10))),
+    );
+
+    f.render_widget(popup, popup_area);
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 fn main() -> io::Result<()> {
@@ -2358,8 +2565,11 @@ fn main() -> io::Result<()> {
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind == KeyEventKind::Press {
-                        // F2 always toggles focus between task list and Claude pane
-                        if key.code == KeyCode::F(2) {
+                        // Alt+Left/Right or F2 toggle focus between task list and Claude pane
+                        let is_focus_toggle = key.code == KeyCode::F(2)
+                            || (key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
+                                && matches!(key.code, KeyCode::Left | KeyCode::Right));
+                        if is_focus_toggle {
                             if !app.claude_panes.is_empty() {
                                 app.claude_focus = !app.claude_focus;
                                 // Auto-release focus if no pane for selected task
@@ -2398,12 +2608,11 @@ fn main() -> io::Result<()> {
                                 app.claude_focus = false;
                             }
                         } else {
-                            // Don't pass Ctrl/Alt-modified character keys to TUI handlers —
+                            // Don't pass Ctrl-modified character keys to TUI handlers —
                             // e.g. Ctrl+C should not trigger the 'c' keybind
                             let dominated = matches!(key.code, KeyCode::Char(_))
-                                && key.modifiers.intersects(
-                                    crossterm::event::KeyModifiers::CONTROL
-                                        | crossterm::event::KeyModifiers::ALT,
+                                && key.modifiers.contains(
+                                    crossterm::event::KeyModifiers::CONTROL,
                                 );
                             if !dominated {
                                 app.handle_key(key.code);
