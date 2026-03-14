@@ -87,6 +87,12 @@ impl Priority {
     }
 }
 
+#[derive(Clone)]
+pub struct Session {
+    pub session_id: String,
+    pub created_at: String,
+}
+
 #[derive(Clone, Serialize)]
 pub struct Task {
     pub id: i64,
@@ -180,7 +186,7 @@ impl Db {
 
     pub fn all_tasks(&self) -> rusqlite::Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, parent_id, title, status, priority, tags, description FROM tasks ORDER BY parent_id NULLS FIRST, id",
+            "SELECT id, parent_id, title, status, priority, tags, description FROM tasks ORDER BY parent_id NULLS FIRST, CASE status WHEN 'done' THEN 0 WHEN 'in_progress' THEN 1 WHEN 'todo' THEN 2 WHEN 'blocked' THEN 3 END, id",
         )?;
         let tasks = stmt
             .query_map([], |row| {
@@ -213,14 +219,27 @@ impl Db {
         Ok(count as usize)
     }
 
-    pub fn sessions_for_task(&self, task_id: i64) -> rusqlite::Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT session_id FROM sessions WHERE task_id = ?1 ORDER BY created_at")?;
+    pub fn sessions_for_task(&self, task_id: i64) -> rusqlite::Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, created_at FROM sessions WHERE task_id = ?1 ORDER BY created_at",
+        )?;
         let sessions = stmt
-            .query_map(params![task_id], |row| row.get(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
+            .query_map(params![task_id], |row| {
+                Ok(Session {
+                    session_id: row.get(0)?,
+                    created_at: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<Session>>>()?;
         Ok(sessions)
+    }
+
+    pub fn delete_session(&self, session_id: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "DELETE FROM sessions WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
     }
 
     pub fn add_task(
@@ -279,6 +298,14 @@ impl Db {
         // CASCADE handles children and sessions automatically
         self.conn
             .execute("DELETE FROM tasks WHERE id = ?1", params![task_id])?;
+        Ok(())
+    }
+
+    pub fn add_session(&self, task_id: i64, session_id: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO sessions (task_id, session_id) VALUES (?1, ?2)",
+            params![task_id, session_id],
+        )?;
         Ok(())
     }
 

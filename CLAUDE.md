@@ -14,12 +14,13 @@ cargo watch -x run   # Auto-reload on code changes (requires cargo-watch)
 
 ## Architecture
 
-Four-file app with Elm-like architecture:
+Five-file app with Elm-like architecture:
 
 - `src/main.rs` — TUI app: state (`App` struct), input handling (`handle_key`/`handle_mouse`), rendering (`ui()`)
 - `src/db.rs` — SQLite layer: schema, migrations, CRUD, tree queries (recursive CTEs)
 - `src/mcp.rs` — MCP server: JSON-RPC over stdio, exposes task CRUD to Claude Code
-- `src/web.rs` — Web UI: Axum server, JSON API, rust-embed static files (`static/` dir baked into binary)
+- `src/pty.rs` — Claude pane: PTY lifecycle (`ClaudePane`), key-to-bytes conversion, prompt construction
+- `src/web.rs` — Web UI: Axum server, JSON API, rust-embed static files (`static/` dir baked into binary) (IMPORTANT: Do not modify Web UI for now, this is a proof of concept. Make all UI updates to the TUI only for now.)
 
 ## Key Patterns
 
@@ -27,6 +28,7 @@ Four-file app with Elm-like architecture:
 - **Tree rendering**: `children_map()` → `tree_walk()` (depth-first) → `tree_prefix()` (Unicode box-drawing ├─/└─/│)
 - **Expand/collapse**: `HashSet<i64>` of collapsed task IDs, checked during tree_walk
 - **Borrow checker pattern**: Extract IDs from `selected_task_view()` before mutating state (e.g., `.map(|tv| tv.task.id)`)
+- **Claude pane**: PTY via `portable-pty`, rendered with `tui-term`/`vt100`. Focus toggled with `F2`. When focused, all keys forwarded to PTY as raw bytes via `key_to_bytes()`. Three-way layout: task table alone, with detail panel, or with Claude pane.
 
 ## Database
 
@@ -82,4 +84,5 @@ Run `cli-todo mcp` (or `cargo run -- mcp`) to start a JSON-RPC/MCP server on std
 - **Storage:** SQLite via rusqlite (bundled)
 - **MCP server:** Built-in (`cargo run -- mcp`), JSON-RPC over stdio
 - **Web UI:** Axum + rust-embed (vanilla JS frontend, no build step)
+- **PTY:** portable-pty + tui-term + vt100 (embedded Claude Code sessions)
 - **Embeddings:** TBD

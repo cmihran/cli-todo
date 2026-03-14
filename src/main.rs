@@ -1,8 +1,9 @@
 mod db;
 mod mcp;
+mod pty;
 mod web;
 
-use crate::db::{Db, Priority, Status, Task};
+use crate::db::{Db, Priority, Session, Status, Task};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
@@ -12,7 +13,7 @@ use crossterm::{
     ExecutableCommand,
 };
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Margin},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
@@ -136,6 +137,29 @@ enum DisplayRow {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+enum EditField {
+    Title,
+    Priority,
+    Tags,
+    Description,
+}
+
+impl EditField {
+    fn label(self) -> &'static str {
+        match self {
+            EditField::Title => "title",
+            EditField::Priority => "priority",
+            EditField::Tags => "tags",
+            EditField::Description => "description",
+        }
+    }
+
+    fn all() -> [EditField; 4] {
+        [EditField::Title, EditField::Priority, EditField::Tags, EditField::Description]
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum ActiveTab {
     All,
     Active,
@@ -166,7 +190,7 @@ impl ActiveTab {
 struct TaskView {
     task: Task,
     session_count: usize,
-    sessions: Vec<String>,
+    sessions: Vec<Session>,
 }
 
 struct App {
@@ -189,8 +213,22 @@ struct App {
     input_cursor: usize,
     input_parent_id: Option<i64>,
     // Layout areas for mouse hit-testing
-    table_area: ratatui::layout::Rect,
-    tab_area: ratatui::layout::Rect,
+    table_area: Rect,
+    tab_area: Rect,
+    // Inline editing
+    edit_mode: bool,
+    edit_field: EditField,
+    edit_buffer: String,
+    edit_cursor: usize,
+    edit_task_id: Option<i64>,
+    show_edit_picker: bool,
+    edit_picker_state: TableState,
+    // Claude panes (task_id → active pane)
+    claude_panes: HashMap<i64, pty::ClaudePane>,
+    claude_focus: bool,
+    claude_pane_area: Rect,
+    show_claude_picker: bool,
+    claude_picker_state: TableState,
     // Active Claude session IDs (detected from running processes)
     active_session_ids: HashSet<String>,
 }
@@ -222,8 +260,28 @@ impl App {
             input_buffer: String::new(),
             input_cursor: 0,
             input_parent_id: None,
+            edit_mode: false,
+            edit_field: EditField::Title,
+            edit_buffer: String::new(),
+            edit_cursor: 0,
+            edit_task_id: None,
+            show_edit_picker: false,
+            edit_picker_state: {
+                let mut s = TableState::default();
+                s.select(Some(0));
+                s
+            },
             table_area: zero_rect,
             tab_area: zero_rect,
+            claude_panes: HashMap::new(),
+            claude_focus: false,
+            show_claude_picker: false,
+            claude_picker_state: {
+                let mut s = TableState::default();
+                s.select(Some(0));
+                s
+            },
+            claude_pane_area: zero_rect,
             active_session_ids: HashSet::new(),
         };
         app.reload_tasks();
@@ -233,6 +291,12 @@ impl App {
 
     fn refresh_active_sessions(&mut self) {
         self.active_session_ids = detect_active_session_ids();
+        // Also include sessions from active Claude panes managed by this TUI
+        for pane in self.claude_panes.values() {
+            if !pane.exited {
+                self.active_session_ids.insert(pane.session_id.clone());
+            }
+        }
     }
 
     fn reload_tasks(&mut self) {
@@ -455,11 +519,96 @@ impl App {
         }
     }
 
+    // ── Claude pane ───────────────────────────────────────────────────────
+
+    fn selected_task_id(&self) -> Option<i64> {
+        self.selected_task_view().map(|tv| tv.task.id)
+    }
+
+    fn spawn_claude_pane(&mut self) {
+        let (task, subtasks) = match self.selected_task_view() {
+            Some(tv) => {
+                let task = tv.task.clone();
+                let subtasks: Vec<Task> = self
+                    .tasks
+                    .iter()
+                    .filter(|t| t.task.parent_id == Some(task.id))
+                    .map(|t| t.task.clone())
+                    .collect();
+                (task, subtasks)
+            }
+            None => return,
+        };
+
+        // Kill existing pane for this task if any
+        if let Some(mut old) = self.claude_panes.remove(&task.id) {
+            old.kill();
+        }
+
+        let area = self.claude_pane_area;
+        let cols = if area.width > 2 { area.width - 2 } else { 80 };
+        let rows = if area.height > 2 { area.height - 2 } else { 24 };
+
+        if let Ok(pane) = pty::ClaudePane::spawn(&task, &subtasks, cols, rows) {
+            let _ = self.db.add_session(pane.task_id, &pane.session_id);
+            let task_id = pane.task_id;
+            // Mark the task as in_progress when an agent starts working on it
+            let _ = self.db.update_status(task_id, Status::InProgress);
+            self.claude_panes.insert(task_id, pane);
+            self.claude_focus = true;
+            self.show_detail = false;
+            self.reload_tasks(); // refresh session counts + status change
+        }
+    }
+
+    fn resume_claude_pane_by_id(&mut self, task_id: i64, session_id: String) {
+        // Kill existing pane for this task if any
+        if let Some(mut old) = self.claude_panes.remove(&task_id) {
+            old.kill();
+        }
+
+        let area = self.claude_pane_area;
+        let cols = if area.width > 2 { area.width - 2 } else { 80 };
+        let rows = if area.height > 2 { area.height - 2 } else { 24 };
+
+        if let Ok(pane) = pty::ClaudePane::resume(&session_id, task_id, cols, rows) {
+            self.claude_panes.insert(task_id, pane);
+            self.claude_focus = true;
+            self.show_detail = false;
+        }
+    }
+
+    fn close_claude_pane(&mut self) {
+        if let Some(task_id) = self.selected_task_id()
+            && let Some(mut pane) = self.claude_panes.remove(&task_id)
+        {
+            pane.kill();
+        }
+        if self.claude_panes.is_empty() {
+            self.claude_focus = false;
+        }
+    }
+
+    fn close_all_claude_panes(&mut self) {
+        for (_, mut pane) in self.claude_panes.drain() {
+            pane.kill();
+        }
+        self.claude_focus = false;
+    }
+
     // ── Key handling ────────────────────────────────────────────────────────
 
     fn handle_key(&mut self, code: KeyCode) {
+        if self.edit_mode {
+            self.handle_edit_key(code);
+            return;
+        }
         if self.input_mode {
             self.handle_input_key(code);
+            return;
+        }
+        if self.show_edit_picker {
+            self.handle_edit_picker_key(code);
             return;
         }
         if self.confirm_delete {
@@ -473,6 +622,10 @@ impl App {
             self.handle_tag_picker_key(code);
             return;
         }
+        if self.show_claude_picker {
+            self.handle_claude_picker_key(code);
+            return;
+        }
         if self.show_help {
             self.show_help = false;
             return;
@@ -480,7 +633,22 @@ impl App {
         let display = self.build_display_rows();
         let display_len = display.len();
         match code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('q') | KeyCode::Esc => {
+                if !self.claude_panes.is_empty() {
+                    // If selected task has an active pane, close just that one
+                    let has_pane = self
+                        .selected_task_id()
+                        .is_some_and(|id| self.claude_panes.contains_key(&id));
+                    if has_pane {
+                        self.close_claude_pane();
+                    } else {
+                        // No pane for current task but others exist — close all
+                        self.close_all_claude_panes();
+                    }
+                } else {
+                    self.quit = true;
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 if display_len > 0 {
                     let mut i = self.table_state.selected().unwrap_or(0);
@@ -663,7 +831,19 @@ impl App {
                 self.input_cursor = 0;
                 self.input_mode = true;
             }
+            KeyCode::Char('e') => {
+                if self.selected_task_view().is_some() {
+                    self.show_edit_picker = true;
+                    self.edit_picker_state.select(Some(0));
+                }
+            }
             KeyCode::Char('d') => self.show_detail = !self.show_detail,
+            KeyCode::Char('c') => {
+                if self.selected_task_view().is_some() {
+                    self.show_claude_picker = true;
+                    self.claude_picker_state.select(Some(0));
+                }
+            }
             KeyCode::Char('?') => self.show_help = true,
             _ => {}
         }
@@ -759,6 +939,210 @@ impl App {
                 }
                 self.show_tag_picker = false;
                 self.table_state.select(Some(0));
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_claude_picker_key(&mut self, code: KeyCode) {
+        let sessions = self
+            .selected_task_view()
+            .map(|tv| tv.sessions.clone())
+            .unwrap_or_default();
+        // Items: "New session" + each existing session (most recent first)
+        let item_count = 1 + sessions.len();
+        match code {
+            KeyCode::Esc | KeyCode::Char('c') => {
+                self.show_claude_picker = false;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                let i = self.claude_picker_state.selected().unwrap_or(0);
+                self.claude_picker_state.select(Some((i + 1) % item_count));
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                let i = self.claude_picker_state.selected().unwrap_or(0);
+                self.claude_picker_state
+                    .select(Some(i.checked_sub(1).unwrap_or(item_count - 1)));
+            }
+            KeyCode::Enter => {
+                let i = self.claude_picker_state.selected().unwrap_or(0);
+                self.show_claude_picker = false;
+                if i == 0 {
+                    self.spawn_claude_pane();
+                } else {
+                    // Sessions are displayed most-recent-first, so reverse index
+                    let rev_idx = sessions.len() - i;
+                    if let Some(session) = sessions.get(rev_idx) {
+                        let task_id = self
+                            .selected_task_view()
+                            .map(|tv| tv.task.id)
+                            .unwrap_or(0);
+                        self.resume_claude_pane_by_id(task_id, session.session_id.clone());
+                    }
+                }
+            }
+            KeyCode::Char('x') | KeyCode::Delete => {
+                let i = self.claude_picker_state.selected().unwrap_or(0);
+                if i > 0 {
+                    let rev_idx = sessions.len() - i;
+                    if let Some(session) = sessions.get(rev_idx) {
+                        let _ = self.db.delete_session(&session.session_id);
+                        self.reload_tasks();
+                        // Clamp selection
+                        let new_count = 1 + sessions.len() - 1;
+                        if i >= new_count {
+                            self.claude_picker_state.select(Some(new_count.saturating_sub(1)));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_edit_picker_key(&mut self, code: KeyCode) {
+        let fields = EditField::all();
+        let item_count = fields.len();
+        match code {
+            KeyCode::Esc | KeyCode::Char('e') => {
+                self.show_edit_picker = false;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                let i = self.edit_picker_state.selected().unwrap_or(0);
+                self.edit_picker_state.select(Some((i + 1) % item_count));
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                let i = self.edit_picker_state.selected().unwrap_or(0);
+                self.edit_picker_state
+                    .select(Some(i.checked_sub(1).unwrap_or(item_count - 1)));
+            }
+            KeyCode::Enter => {
+                let i = self.edit_picker_state.selected().unwrap_or(0);
+                let field = fields[i];
+                if let Some(tv) = self.selected_task_view() {
+                    let task = &tv.task;
+                    let task_id = task.id;
+                    match field {
+                        EditField::Priority => {
+                            // Cycle priority directly
+                            let new_priority = match task.priority {
+                                Priority::Low => Priority::Medium,
+                                Priority::Medium => Priority::High,
+                                Priority::High => Priority::Critical,
+                                Priority::Critical => Priority::Low,
+                            };
+                            if let Some(idx) = self.tasks.iter().position(|t| t.task.id == task_id)
+                            {
+                                let _ = self.db.update_task(
+                                    task_id,
+                                    None,
+                                    None,
+                                    Some(new_priority),
+                                    None,
+                                    None,
+                                );
+                                self.tasks[idx].task.priority = new_priority;
+                            }
+                        }
+                        _ => {
+                            // Text fields: enter edit mode with pre-filled buffer
+                            let value = match field {
+                                EditField::Title => task.title.clone(),
+                                EditField::Tags => task.tags.join(", "),
+                                EditField::Description => task.description.clone(),
+                                EditField::Priority => unreachable!(),
+                            };
+                            self.edit_task_id = Some(task_id);
+                            self.edit_field = field;
+                            self.edit_buffer = value;
+                            self.edit_cursor = self.edit_buffer.len();
+                            self.edit_mode = true;
+                            self.show_edit_picker = false;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_edit_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.edit_mode = false;
+                self.edit_buffer.clear();
+                self.edit_task_id = None;
+            }
+            KeyCode::Enter => {
+                if let Some(task_id) = self.edit_task_id {
+                    let value = self.edit_buffer.clone();
+                    match self.edit_field {
+                        EditField::Title => {
+                            if !value.trim().is_empty() {
+                                let _ = self.db.update_task(
+                                    task_id,
+                                    Some(value.trim()),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                );
+                            }
+                        }
+                        EditField::Tags => {
+                            let tags: Vec<String> = value
+                                .split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            let _ =
+                                self.db
+                                    .update_task(task_id, None, None, None, Some(&tags), None);
+                        }
+                        EditField::Description => {
+                            let _ = self.db.update_task(
+                                task_id,
+                                None,
+                                None,
+                                None,
+                                None,
+                                Some(&value),
+                            );
+                        }
+                        EditField::Priority => unreachable!(),
+                    }
+                    self.reload_tasks();
+                }
+                self.edit_mode = false;
+                self.edit_buffer.clear();
+                self.edit_task_id = None;
+            }
+            KeyCode::Backspace => {
+                if self.edit_cursor > 0 {
+                    self.edit_cursor -= 1;
+                    self.edit_buffer.remove(self.edit_cursor);
+                }
+            }
+            KeyCode::Delete => {
+                if self.edit_cursor < self.edit_buffer.len() {
+                    self.edit_buffer.remove(self.edit_cursor);
+                }
+            }
+            KeyCode::Left => {
+                if self.edit_cursor > 0 {
+                    self.edit_cursor -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if self.edit_cursor < self.edit_buffer.len() {
+                    self.edit_cursor += 1;
+                }
+            }
+            KeyCode::Home => self.edit_cursor = 0,
+            KeyCode::End => self.edit_cursor = self.edit_buffer.len(),
+            KeyCode::Char(c) => {
+                self.edit_buffer.insert(self.edit_cursor, c);
+                self.edit_cursor += 1;
             }
             _ => {}
         }
@@ -878,7 +1262,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     render_header(f, outer[0], app);
     render_tabs(f, outer[1], app);
     render_body(f, outer[2], app);
-    if app.input_mode {
+    if app.edit_mode {
+        render_edit_bar(f, outer[3], app);
+    } else if app.input_mode {
         render_input_bar(f, outer[3], app);
     } else {
         render_status_bar(f, outer[3], app);
@@ -892,6 +1278,12 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
     if app.show_tag_picker {
         render_tag_picker(f, app);
+    }
+    if app.show_claude_picker {
+        render_claude_picker(f, app);
+    }
+    if app.show_edit_picker {
+        render_edit_picker(f, app);
     }
 }
 
@@ -984,17 +1376,28 @@ fn render_tabs(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     f.render_widget(tabs, area);
 }
 
-fn render_body(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
-    if app.show_detail {
+fn render_body(f: &mut Frame, area: Rect, app: &mut App) {
+    if !app.claude_panes.is_empty() {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(area);
+        app.table_area = chunks[0];
+        app.claude_pane_area = chunks[1];
+        render_task_table(f, chunks[0], app);
+        render_claude_pane(f, chunks[1], app);
+    } else if app.show_detail {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(area);
         app.table_area = chunks[0];
+        app.claude_pane_area = area; // store for initial spawn sizing
         render_task_table(f, chunks[0], app);
         render_detail_panel(f, chunks[1], app);
     } else {
         app.table_area = area;
+        app.claude_pane_area = area;
         render_task_table(f, area, app);
     }
 }
@@ -1122,7 +1525,7 @@ fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
                     task.tags.join(", "),
                     Style::default().fg(Color::DarkGray),
                 ));
-                let has_active = tv.sessions.iter().any(|s| app.active_session_ids.contains(s));
+                let has_active = tv.sessions.iter().any(|s| app.active_session_ids.contains(&s.session_id));
                 let session_display = if has_active {
                     format!("▶ {}", tv.session_count)
                 } else if tv.session_count == 0 {
@@ -1307,7 +1710,7 @@ fn render_detail_panel(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     }
 
     // Claude sessions
-    let any_active = tv.sessions.iter().any(|s| app.active_session_ids.contains(s));
+    let any_active = tv.sessions.iter().any(|s| app.active_session_ids.contains(&s.session_id));
     lines.push(Line::from(Span::styled(
         if any_active { "claude sessions (active)" } else { "claude sessions" },
         Style::default().fg(if any_active { Color::Green } else { Color::DarkGray }),
@@ -1319,7 +1722,7 @@ fn render_detail_panel(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         )));
     } else {
         for session in &tv.sessions {
-            let is_active = app.active_session_ids.contains(session);
+            let is_active = app.active_session_ids.contains(&session.session_id);
             let (icon, color) = if is_active {
                 ("▶", Color::Green)
             } else {
@@ -1327,7 +1730,11 @@ fn render_detail_panel(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             };
             lines.push(Line::from(vec![
                 Span::styled(format!("  {} ", icon), Style::default().fg(color)),
-                Span::styled(session.as_str(), Style::default().fg(color)),
+                Span::styled(&session.session_id, Style::default().fg(color)),
+                Span::styled(
+                    format!("  {}", session.created_at),
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]));
         }
     }
@@ -1339,6 +1746,54 @@ fn render_detail_panel(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     f.render_widget(detail, area);
 }
 
+fn render_claude_pane(f: &mut Frame, area: Rect, app: &App) {
+    let selected_id = app.selected_task_id();
+    let pane = selected_id.and_then(|id| app.claude_panes.get(&id));
+
+    let border_color = if app.claude_focus && pane.is_some() {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+
+    let pane_count = app.claude_panes.len();
+    let title = if let Some(p) = pane {
+        format!(" Claude - Task #{} ({} active) ", p.task_id, pane_count)
+    } else {
+        format!(" Claude ({} active) ", pane_count)
+    };
+
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default().fg(border_color).bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+
+    let inner_area = block.inner(area);
+    f.render_widget(block, area);
+
+    if let Some(p) = pane {
+        if let Ok(parser) = p.parser.lock() {
+            let screen = parser.screen();
+            let pseudo_term = tui_term::widget::PseudoTerminal::new(screen);
+            f.render_widget(pseudo_term, inner_area);
+        }
+    } else {
+        // Empty state — no active session for this task
+        let hint = Paragraph::new(Line::from(vec![
+            Span::styled("No active session", Style::default().fg(Color::DarkGray)),
+            Span::styled(" — press ", Style::default().fg(Color::DarkGray)),
+            Span::styled("c", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(" to start", Style::default().fg(Color::DarkGray)),
+        ]))
+        .block(Block::default().padding(Padding::new(2, 0, 1, 0)));
+        f.render_widget(hint, inner_area);
+    }
+}
+
 fn render_status_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let filtered_len = app.filtered_tasks().len();
     let pos = app
@@ -1347,84 +1802,79 @@ fn render_status_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         .map(|i| format!("{}/{}", i + 1, filtered_len))
         .unwrap_or_else(|| "0/0".into());
 
-    let bar = Line::from(vec![
-        Span::styled(
-            " j/k ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::DarkGray)
-                .bold(),
-        ),
-        Span::styled(" nav ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            " h/l ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::DarkGray)
-                .bold(),
-        ),
-        Span::styled(" tree ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            " tab ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::DarkGray)
-                .bold(),
-        ),
-        Span::styled(" status ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            " t ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::DarkGray)
-                .bold(),
-        ),
-        Span::styled(" tag ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            " g ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::DarkGray)
-                .bold(),
-        ),
-        Span::styled(" group ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            " a ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::DarkGray)
-                .bold(),
-        ),
-        Span::styled(" add ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            " d ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::DarkGray)
-                .bold(),
-        ),
-        Span::styled(" detail ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            " ? ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::DarkGray)
-                .bold(),
-        ),
-        Span::styled(" help ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            " q ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::DarkGray)
-                .bold(),
-        ),
-        Span::styled(" quit ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!("  {} ", pos),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
+    let key_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::DarkGray)
+        .bold();
+    let label_style = Style::default().fg(Color::DarkGray);
+
+    let has_pane_for_selected = app
+        .selected_task_id()
+        .is_some_and(|id| app.claude_panes.contains_key(&id));
+
+    let bar = if app.claude_focus {
+        Line::from(vec![
+            Span::styled(" F2 ", key_style),
+            Span::styled(" focus tasks ", label_style),
+            Span::styled(" q ", key_style),
+            Span::styled(" close Claude ", label_style),
+            Span::styled(
+                format!("  {} ", pos),
+                label_style,
+            ),
+        ])
+    } else if !app.claude_panes.is_empty() {
+        let focus_hint = if has_pane_for_selected {
+            " focus Claude "
+        } else {
+            " focus Claude (no session) "
+        };
+        Line::from(vec![
+            Span::styled(" F2 ", key_style),
+            Span::styled(focus_hint, label_style),
+            Span::styled(" q ", key_style),
+            Span::styled(" close Claude ", label_style),
+            Span::styled(" j/k ", key_style),
+            Span::styled(" nav ", label_style),
+            Span::styled(" s ", key_style),
+            Span::styled(" status ", label_style),
+            Span::styled(" ? ", key_style),
+            Span::styled(" help ", label_style),
+            Span::styled(
+                format!("  {} ", pos),
+                label_style,
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" j/k ", key_style),
+            Span::styled(" nav ", label_style),
+            Span::styled(" h/l ", key_style),
+            Span::styled(" tree ", label_style),
+            Span::styled(" tab ", key_style),
+            Span::styled(" status ", label_style),
+            Span::styled(" t ", key_style),
+            Span::styled(" tag ", label_style),
+            Span::styled(" g ", key_style),
+            Span::styled(" group ", label_style),
+            Span::styled(" a ", key_style),
+            Span::styled(" add ", label_style),
+            Span::styled(" e ", key_style),
+            Span::styled(" edit ", label_style),
+            Span::styled(" c ", key_style),
+            Span::styled(" claude ", label_style),
+            Span::styled(" d ", key_style),
+            Span::styled(" detail ", label_style),
+            Span::styled(" ? ", key_style),
+            Span::styled(" help ", label_style),
+            Span::styled(" q ", key_style),
+            Span::styled(" quit ", label_style),
+            Span::styled(
+                format!("  {} ", pos),
+                label_style,
+            ),
+        ])
+    };
     f.render_widget(Paragraph::new(bar), area);
 }
 
@@ -1455,10 +1905,117 @@ fn render_input_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     ));
 }
 
+fn render_edit_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let label = format!("edit {}: ", app.edit_field.label());
+    let bar = Line::from(vec![
+        Span::styled(
+            &label,
+            Style::default().fg(Color::Yellow).bold(),
+        ),
+        Span::styled(&app.edit_buffer, Style::default().fg(Color::White)),
+        Span::styled("█", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "  (Enter to save, Esc to cancel)",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(bar), area);
+    #[allow(clippy::cast_possible_truncation)]
+    f.set_cursor_position((
+        area.x + label.len() as u16 + app.edit_cursor as u16,
+        area.y,
+    ));
+}
+
+fn render_edit_picker(f: &mut Frame, app: &mut App) {
+    let tv = match app.selected_task_view() {
+        Some(tv) => tv,
+        None => return,
+    };
+    let task = &tv.task;
+
+    let fields = EditField::all();
+    let values: Vec<String> = fields
+        .iter()
+        .map(|field| match field {
+            EditField::Title => task.title.clone(),
+            EditField::Priority => task.priority.label().to_string(),
+            EditField::Tags => task.tags.join(", "),
+            EditField::Description => {
+                let d = &task.description;
+                if d.len() > 30 {
+                    format!("{}...", &d[..27])
+                } else {
+                    d.clone()
+                }
+            }
+        })
+        .collect();
+
+    let area = f.area();
+    let popup_height = (fields.len() as u16 + 3).min(area.height.saturating_sub(4));
+    let popup_width = 50u16.min(area.width.saturating_sub(4));
+    let popup_area = Rect {
+        x: (area.width.saturating_sub(popup_width)) / 2,
+        y: (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    f.render_widget(Clear, popup_area);
+
+    let rows: Vec<Row> = fields
+        .iter()
+        .zip(values.iter())
+        .map(|(field, value)| {
+            let hint = if *field == EditField::Priority {
+                " (Enter to cycle)"
+            } else {
+                ""
+            };
+            let val_display = if value.is_empty() {
+                "(empty)".to_string()
+            } else {
+                value.clone()
+            };
+            Row::new(vec![
+                Cell::from(Span::styled(
+                    format!("  {:<13}", field.label()),
+                    Style::default().fg(Color::Cyan),
+                )),
+                Cell::from(Span::styled(
+                    format!("{}{}", val_display, hint),
+                    Style::default().fg(Color::White),
+                )),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(rows, [Constraint::Length(15), Constraint::Min(20)])
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    " Edit task ",
+                    Style::default().fg(Color::Yellow).bold(),
+                ))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Yellow))
+                .style(Style::default().bg(Color::Rgb(15, 15, 25))),
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(30, 40, 55))
+                .add_modifier(Modifier::BOLD),
+        );
+
+    f.render_stateful_widget(table, popup_area, &mut app.edit_picker_state);
+}
+
 fn render_help_popup(f: &mut Frame) {
     let area = f.area();
     let popup_width = 54u16.min(area.width.saturating_sub(4));
-    let popup_height = 24u16.min(area.height.saturating_sub(4));
+    let popup_height = 29u16.min(area.height.saturating_sub(4));
     let popup_area = ratatui::layout::Rect {
         x: (area.width.saturating_sub(popup_width)) / 2,
         y: (area.height.saturating_sub(popup_height)) / 2,
@@ -1531,6 +2088,10 @@ fn render_help_popup(f: &mut Frame) {
             Span::styled("Add child task", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
+            Span::styled("  e          ", Style::default().fg(Color::Cyan)),
+            Span::styled("Edit task fields", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
             Span::styled("  x          ", Style::default().fg(Color::Cyan)),
             Span::styled("Delete task", Style::default().fg(Color::White)),
         ]),
@@ -1539,8 +2100,16 @@ fn render_help_popup(f: &mut Frame) {
             Span::styled("Toggle detail panel", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
+            Span::styled("  c          ", Style::default().fg(Color::Cyan)),
+            Span::styled("Claude session picker", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  F2         ", Style::default().fg(Color::Cyan)),
+            Span::styled("Toggle Claude focus", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
             Span::styled("  q / Esc    ", Style::default().fg(Color::Cyan)),
-            Span::styled("Quit", Style::default().fg(Color::White)),
+            Span::styled("Close Claude / Quit", Style::default().fg(Color::White)),
         ]),
         Line::from(""),
     ];
@@ -1619,6 +2188,70 @@ fn render_tag_picker(f: &mut Frame, app: &mut App) {
         );
 
     f.render_stateful_widget(table, popup_area, &mut app.tag_picker_state);
+}
+
+fn render_claude_picker(f: &mut Frame, app: &mut App) {
+    let sessions = app
+        .selected_task_view()
+        .map(|tv| tv.sessions.clone())
+        .unwrap_or_default();
+    let item_count = 1 + sessions.len(); // "New session" + existing sessions
+    let area = f.area();
+    let popup_height = (item_count as u16 + 3).min(area.height.saturating_sub(4));
+    let popup_width = 48u16.min(area.width.saturating_sub(4));
+    let popup_area = Rect {
+        x: (area.width.saturating_sub(popup_width)) / 2,
+        y: (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    f.render_widget(Clear, popup_area);
+
+    let mut rows: Vec<Row> = vec![Row::new(vec![Cell::from(Span::styled(
+        "  + New session",
+        Style::default().fg(Color::Cyan),
+    ))])];
+
+    // Show sessions most-recent-first
+    for session in sessions.iter().rev() {
+        let id_short = if session.session_id.len() > 8 {
+            &session.session_id[..8]
+        } else {
+            &session.session_id
+        };
+        let display = format!("    {} - {}", session.created_at, id_short);
+        rows.push(Row::new(vec![Cell::from(Span::styled(
+            display,
+            Style::default().fg(Color::Magenta),
+        ))]));
+    }
+
+    let table = Table::new(rows, [Constraint::Min(1)])
+        .block(
+            Block::default()
+                .title(Line::from(vec![
+                    Span::styled(
+                        " Claude sessions ",
+                        Style::default().fg(Color::Cyan).bold(),
+                    ),
+                    Span::styled(
+                        "x=remove ",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan))
+                .style(Style::default().bg(Color::Rgb(15, 15, 25))),
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(30, 40, 55))
+                .add_modifier(Modifier::BOLD),
+        );
+
+    f.render_stateful_widget(table, popup_area, &mut app.claude_picker_state);
 }
 
 fn render_delete_confirm(f: &mut Frame, app: &App) {
@@ -1714,17 +2347,101 @@ fn main() -> io::Result<()> {
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
 
-        if event::poll(std::time::Duration::from_secs(1))? {
+        // Faster refresh when any Claude pane is active for smooth rendering
+        let poll_timeout = if !app.claude_panes.is_empty() {
+            std::time::Duration::from_millis(16)
+        } else {
+            std::time::Duration::from_secs(1)
+        };
+
+        if event::poll(poll_timeout)? {
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind == KeyEventKind::Press {
-                        app.handle_key(key.code);
+                        // F2 always toggles focus between task list and Claude pane
+                        if key.code == KeyCode::F(2) {
+                            if !app.claude_panes.is_empty() {
+                                app.claude_focus = !app.claude_focus;
+                                // Auto-release focus if no pane for selected task
+                                if app.claude_focus {
+                                    let has_pane = app
+                                        .selected_task_id()
+                                        .is_some_and(|id| app.claude_panes.contains_key(&id));
+                                    if !has_pane {
+                                        app.claude_focus = false;
+                                    }
+                                }
+                            }
+                        } else if app.claude_focus {
+                            // Forward all keys to PTY for the visible pane
+                            // Except: q/Esc closes pane when Claude has exited
+                            let selected_id = app.selected_task_id();
+                            let visible_exited = selected_id
+                                .and_then(|id| app.claude_panes.get_mut(&id))
+                                .is_some_and(|p| p.try_wait());
+                            if visible_exited {
+                                match key.code {
+                                    KeyCode::Char('q') | KeyCode::Esc => {
+                                        app.close_claude_pane();
+                                    }
+                                    _ => {}
+                                }
+                            } else if let Some(pane) = selected_id
+                                .and_then(|id| app.claude_panes.get_mut(&id))
+                            {
+                                let bytes = pty::key_to_bytes(&key);
+                                if !bytes.is_empty() {
+                                    pane.write(&bytes);
+                                }
+                            } else {
+                                // No pane for selected task — release focus
+                                app.claude_focus = false;
+                            }
+                        } else {
+                            // Don't pass Ctrl/Alt-modified character keys to TUI handlers —
+                            // e.g. Ctrl+C should not trigger the 'c' keybind
+                            let dominated = matches!(key.code, KeyCode::Char(_))
+                                && key.modifiers.intersects(
+                                    crossterm::event::KeyModifiers::CONTROL
+                                        | crossterm::event::KeyModifiers::ALT,
+                                );
+                            if !dominated {
+                                app.handle_key(key.code);
+                            }
+                        }
                     }
                 }
                 Event::Mouse(mouse) => {
-                    app.handle_mouse(mouse.kind, mouse.column, mouse.row);
+                    if !app.claude_focus {
+                        app.handle_mouse(mouse.kind, mouse.column, mouse.row);
+                    }
+                }
+                Event::Resize(_cols, _rows) => {
+                    if !app.claude_panes.is_empty() {
+                        let area = app.claude_pane_area;
+                        let inner_cols = if area.width > 2 { area.width - 2 } else { 1 };
+                        let inner_rows = if area.height > 2 { area.height - 2 } else { 1 };
+                        for pane in app.claude_panes.values() {
+                            pane.resize(inner_cols, inner_rows);
+                        }
+                    }
                 }
                 _ => {}
+            }
+        }
+
+        // Check if any Claude processes have exited
+        for pane in app.claude_panes.values_mut() {
+            pane.try_wait();
+        }
+        // If the visible pane exited, release focus
+        if app.claude_focus {
+            let visible_exited = app
+                .selected_task_id()
+                .and_then(|id| app.claude_panes.get(&id))
+                .is_some_and(|p| p.exited);
+            if visible_exited {
+                app.claude_focus = false;
             }
         }
 
@@ -1756,6 +2473,11 @@ fn main() -> io::Result<()> {
         if app.quit {
             break;
         }
+    }
+
+    // Clean up all Claude panes
+    for (_, mut pane) in app.claude_panes.drain() {
+        pane.kill();
     }
 
     disable_raw_mode()?;
