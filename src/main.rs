@@ -109,6 +109,7 @@ fn detect_active_session_ids() -> HashSet<String> {
 
 #[derive(Default)]
 struct GitStatus {
+    in_repo: bool,
     branch: String,
     changed_files: usize,
     staged_files: usize,
@@ -118,6 +119,16 @@ struct GitStatus {
 
 fn detect_git_status() -> GitStatus {
     let mut status = GitStatus::default();
+
+    // Check if we're in a git repo at all
+    let in_repo = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !in_repo {
+        return status;
+    }
+    status.in_repo = true;
 
     // Current branch
     if let Ok(out) = std::process::Command::new("git")
@@ -1870,7 +1881,7 @@ fn render_header(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     // Build git status spans for the right side
     let mut git_spans: Vec<Span> = Vec::new();
     let gs = &app.git_status;
-    if !gs.branch.is_empty() {
+    if gs.in_repo {
         git_spans.push(Span::styled(" ", Style::default().fg(Color::DarkGray)));
         git_spans.push(Span::styled(
             &gs.branch,
@@ -3317,8 +3328,10 @@ fn main() -> io::Result<()> {
             last_session_check = std::time::Instant::now();
         }
 
-        // Refresh git status every 5 seconds
-        if app.last_git_check.elapsed() >= std::time::Duration::from_secs(5) {
+        // Refresh git status every 5 seconds (skip if not in a repo)
+        if app.git_status.in_repo
+            && app.last_git_check.elapsed() >= std::time::Duration::from_secs(5)
+        {
             app.git_status = detect_git_status();
             app.last_git_check = std::time::Instant::now();
         }
