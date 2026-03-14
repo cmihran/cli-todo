@@ -468,8 +468,19 @@ impl App {
 
         if self.group_by == GroupBy::None {
             let tree = self.tree_walk();
-            return tree
-                .into_iter()
+
+            if !has_filter {
+                return tree
+                    .into_iter()
+                    .map(|(idx, depth)| DisplayRow::Task { idx, depth })
+                    .collect();
+            }
+
+            // Filter is active — show matching tasks with adjusted depths.
+            // Effective depth = number of ancestors that also match the filter,
+            // so children of hidden parents get promoted rather than orphaned.
+            let matching_task_ids: HashSet<i64> = tree
+                .iter()
                 .filter(|(idx, _)| {
                     let tv = &self.tasks[*idx];
                     self.active_tab.filter(tv.task.status)
@@ -478,10 +489,26 @@ impl App {
                             Some(tag) => tv.task.tags.contains(tag),
                         }
                 })
-                .map(|(idx, depth)| DisplayRow::Task {
-                    idx,
-                    // When filters are active, flatten to avoid orphaned children
-                    depth: if has_filter { 0 } else { depth },
+                .map(|(idx, _)| self.tasks[*idx].task.id)
+                .collect();
+
+            return tree
+                .into_iter()
+                .filter(|(idx, _)| matching_task_ids.contains(&self.tasks[*idx].task.id))
+                .map(|(idx, _depth)| {
+                    let mut effective_depth = 0;
+                    let mut current_parent = self.tasks[idx].task.parent_id;
+                    while let Some(pid) = current_parent {
+                        if matching_task_ids.contains(&pid) {
+                            effective_depth += 1;
+                        }
+                        if let Some(parent_tv) = self.tasks.iter().find(|tv| tv.task.id == pid) {
+                            current_parent = parent_tv.task.parent_id;
+                        } else {
+                            break;
+                        }
+                    }
+                    DisplayRow::Task { idx, depth: effective_depth }
                 })
                 .collect();
         }
