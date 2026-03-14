@@ -31,6 +31,7 @@ fn status_color(s: Status) -> Color {
     match s {
         Status::Todo => Color::DarkGray,
         Status::InProgress => Color::Yellow,
+        Status::InReview => Color::Magenta,
         Status::Done => Color::Green,
         Status::Blocked => Color::Red,
     }
@@ -40,6 +41,7 @@ fn status_icon(s: Status) -> &'static str {
     match s {
         Status::Todo => "○",
         Status::InProgress => "◐",
+        Status::InReview => "◑",
         Status::Done => "●",
         Status::Blocked => "✕",
     }
@@ -188,6 +190,7 @@ impl EditField {
 enum ActiveTab {
     All,
     Active,
+    InReview,
     Blocked,
     Done,
 }
@@ -197,8 +200,9 @@ impl ActiveTab {
         match self {
             ActiveTab::All => 0,
             ActiveTab::Active => 1,
-            ActiveTab::Blocked => 2,
-            ActiveTab::Done => 3,
+            ActiveTab::InReview => 2,
+            ActiveTab::Blocked => 3,
+            ActiveTab::Done => 4,
         }
     }
 
@@ -206,6 +210,7 @@ impl ActiveTab {
         match self {
             ActiveTab::All => true,
             ActiveTab::Active => status == Status::InProgress || status == Status::Todo,
+            ActiveTab::InReview => status == Status::InReview,
             ActiveTab::Blocked => status == Status::Blocked,
             ActiveTab::Done => status == Status::Done,
         }
@@ -392,8 +397,9 @@ impl App {
                             match tasks[idx].task.status {
                                 Status::InProgress => 0,
                                 Status::Todo => 1,
-                                Status::Blocked => 2,
-                                Status::Done => 3,
+                                Status::InReview => 2,
+                                Status::Blocked => 3,
+                                Status::Done => 4,
                             }
                         });
                         v
@@ -510,7 +516,7 @@ impl App {
         }
 
         let ordered_keys: Vec<String> = match self.group_by {
-            GroupBy::Status => vec!["IN PROGRESS", "TODO", "BLOCKED", "DONE"]
+            GroupBy::Status => vec!["IN PROGRESS", "TODO", "IN REVIEW", "BLOCKED", "DONE"]
                 .into_iter()
                 .map(String::from)
                 .filter(|k| group_map.contains_key(k))
@@ -731,7 +737,8 @@ impl App {
             KeyCode::Tab => {
                 self.active_tab = match self.active_tab {
                     ActiveTab::All => ActiveTab::Active,
-                    ActiveTab::Active => ActiveTab::Blocked,
+                    ActiveTab::Active => ActiveTab::InReview,
+                    ActiveTab::InReview => ActiveTab::Blocked,
                     ActiveTab::Blocked => ActiveTab::Done,
                     ActiveTab::Done => ActiveTab::All,
                 };
@@ -741,7 +748,8 @@ impl App {
                 self.active_tab = match self.active_tab {
                     ActiveTab::All => ActiveTab::Done,
                     ActiveTab::Active => ActiveTab::All,
-                    ActiveTab::Blocked => ActiveTab::Active,
+                    ActiveTab::InReview => ActiveTab::Active,
+                    ActiveTab::Blocked => ActiveTab::InReview,
                     ActiveTab::Done => ActiveTab::Blocked,
                 };
                 self.select_first_task();
@@ -1305,8 +1313,9 @@ impl App {
                             self.active_tab = match i {
                                 0 => ActiveTab::All,
                                 1 => ActiveTab::Active,
-                                2 => ActiveTab::Blocked,
-                                3 => ActiveTab::Done,
+                                2 => ActiveTab::InReview,
+                                3 => ActiveTab::Blocked,
+                                4 => ActiveTab::Done,
                                 _ => self.active_tab,
                             };
                             self.select_first_task();
@@ -1356,6 +1365,13 @@ impl App {
                     .filter(
                         |tv| tv.task.status == Status::InProgress || tv.task.status == Status::Todo
                     )
+                    .count()
+            ),
+            format!(
+                "Review ({})",
+                self.tasks
+                    .iter()
+                    .filter(|tv| tv.task.status == Status::InReview)
                     .count()
             ),
             format!(
@@ -1488,6 +1504,13 @@ fn render_tabs(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .filter(
                     |tv| tv.task.status == Status::InProgress || tv.task.status == Status::Todo
                 )
+                .count()
+        ),
+        format!(
+            " Review ({}) ",
+            app.tasks
+                .iter()
+                .filter(|tv| tv.task.status == Status::InReview)
                 .count()
         ),
         format!(

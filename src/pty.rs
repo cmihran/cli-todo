@@ -181,12 +181,7 @@ fn reader_thread(mut reader: Box<dyn std::io::Read + Send>, parser: Arc<Mutex<vt
 }
 
 fn build_prompt(task: &Task, subtasks: &[Task]) -> String {
-    let status_str = match task.status {
-        Status::Todo => "todo",
-        Status::InProgress => "in_progress",
-        Status::Done => "done",
-        Status::Blocked => "blocked",
-    };
+    let status_str = task.status.as_str();
     let priority_str = task.priority.as_str();
     let tags_str = if task.tags.is_empty() {
         String::new()

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 pub enum Status {
     Todo,
     InProgress,
+    InReview,
     Done,
     Blocked,
 }
@@ -16,6 +17,7 @@ impl Status {
         match self {
             Status::Todo => "TODO",
             Status::InProgress => "IN PROGRESS",
+            Status::InReview => "IN REVIEW",
             Status::Done => "DONE",
             Status::Blocked => "BLOCKED",
         }
@@ -25,6 +27,7 @@ impl Status {
         match self {
             Status::Todo => "todo",
             Status::InProgress => "in_progress",
+            Status::InReview => "in_review",
             Status::Done => "done",
             Status::Blocked => "blocked",
         }
@@ -33,7 +36,8 @@ impl Status {
     pub fn next(self) -> Self {
         match self {
             Status::Todo => Status::InProgress,
-            Status::InProgress => Status::Done,
+            Status::InProgress => Status::InReview,
+            Status::InReview => Status::Done,
             Status::Done => Status::Todo,
             Status::Blocked => Status::Todo,
         }
@@ -42,6 +46,7 @@ impl Status {
     pub fn from_str(s: &str) -> Self {
         match s {
             "in_progress" => Status::InProgress,
+            "in_review" => Status::InReview,
             "done" => Status::Done,
             "blocked" => Status::Blocked,
             _ => Status::Todo,
