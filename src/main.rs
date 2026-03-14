@@ -1958,8 +1958,19 @@ fn render_claude_pane(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let pane_count = app.claude_panes.len();
+    let scrollback_offset = pane
+        .and_then(|p| p.parser.lock().ok().map(|parser| parser.screen().scrollback()))
+        .unwrap_or(0);
+    let scroll_indicator = if scrollback_offset > 0 {
+        format!(" [scrolled +{}]", scrollback_offset)
+    } else {
+        String::new()
+    };
     let title = if let Some(p) = pane {
-        format!(" Claude - Task #{} ({} active) ", p.task_id, pane_count)
+        format!(
+            " Claude - Task #{} ({} active){} ",
+            p.task_id, pane_count, scroll_indicator
+        )
     } else {
         format!(" Claude ({} active) ", pane_count)
     };
@@ -2675,7 +2686,44 @@ fn main() -> io::Result<()> {
                     }
                 }
                 Event::Mouse(mouse) => {
-                    if !app.claude_focus {
+                    // Check if scroll event is over the Claude pane area
+                    let over_claude = !app.claude_panes.is_empty()
+                        && mouse.column >= app.claude_pane_area.x
+                        && mouse.column
+                            < app.claude_pane_area.x + app.claude_pane_area.width
+                        && mouse.row >= app.claude_pane_area.y
+                        && mouse.row
+                            < app.claude_pane_area.y + app.claude_pane_area.height;
+
+                    if over_claude {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                                let scroll_lines: usize = 3;
+                                if let Some(pane) = app
+                                    .selected_task_id()
+                                    .and_then(|id| app.claude_panes.get(&id))
+                                {
+                                    if let Ok(mut parser) = pane.parser.lock() {
+                                        let screen = parser.screen_mut();
+                                        let current = screen.scrollback();
+                                        match mouse.kind {
+                                            MouseEventKind::ScrollUp => {
+                                                screen
+                                                    .set_scrollback(current + scroll_lines);
+                                            }
+                                            MouseEventKind::ScrollDown => {
+                                                screen.set_scrollback(
+                                                    current.saturating_sub(scroll_lines),
+                                                );
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else if !app.claude_focus {
                         app.handle_mouse(mouse.kind, mouse.column, mouse.row);
                     }
                 }
