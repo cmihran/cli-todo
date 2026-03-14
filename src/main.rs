@@ -1807,11 +1807,12 @@ fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
 
     // Compute available width for the title column:
     // inner = area.width - border_right(1) - padding_left(1) - padding_right(1)
-    // title_width = inner - fixed_columns(2+6+14+10) - column_gaps(4×1)
-    let title_col_width = (area.width as usize).saturating_sub(39);
+    // title_width = inner - fixed_columns(2+4+6+14+10) - column_gaps(5×1)
+    let title_col_width = (area.width as usize).saturating_sub(44);
 
     let header = Row::new(vec![
         Cell::from(" "),
+        Cell::from("ID"),
         Cell::from("Task"),
         Cell::from("Priority"),
         Cell::from("Tags"),
@@ -1831,6 +1832,7 @@ fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
             DisplayRow::Header(label) => {
                 let header_text = format!("── {} ──", label);
                 Row::new(vec![
+                    Cell::from(""),
                     Cell::from(""),
                     Cell::from(Span::styled(
                         header_text,
@@ -1900,8 +1902,14 @@ fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
                 };
                 let session_cell = Cell::from(Span::styled(session_display, session_style));
 
+                let id_cell = Cell::from(Span::styled(
+                    format!("{}", task.id),
+                    Style::default().fg(Color::DarkGray),
+                ));
+
                 Row::new(vec![
                     status_cell,
+                    id_cell,
                     title_cell,
                     priority_cell,
                     tags_cell,
@@ -1916,6 +1924,7 @@ fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
         rows,
         [
             Constraint::Length(2),
+            Constraint::Length(4),
             Constraint::Min(20),
             Constraint::Length(6),
             Constraint::Length(14),
