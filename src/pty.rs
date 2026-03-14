@@ -212,10 +212,14 @@ fn build_prompt(task: &Task, subtasks: &[Task]) -> String {
         format!("\n\nSubtasks:\n{}", items.join("\n"))
     };
 
-    format!(
-        "You are working on task #{}: {}\nStatus: {} | Priority: {}{}{}{}\n\nPlease implement this task. Do your work in a git worktree to avoid conflicts with other agents. Update the task status via the cli-todo MCP tools.",
-        task.id, task.title, status_str, priority_str, tags_str, desc_str, subtask_str
-    )
+    include_str!("prompt.md")
+        .replace("{id}", &task.id.to_string())
+        .replace("{title}", &task.title)
+        .replace("{status}", status_str)
+        .replace("{priority}", priority_str)
+        .replace("{tags}", &tags_str)
+        .replace("{description}", &desc_str)
+        .replace("{subtasks}", &subtask_str)
 }
 
 /// Convert a crossterm KeyEvent to raw terminal bytes for the PTY.
