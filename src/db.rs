@@ -107,6 +107,7 @@ pub struct Task {
     pub priority: Priority,
     pub tags: Vec<String>,
     pub description: String,
+    pub updated_at: String,
 }
 
 pub struct Db {
@@ -175,7 +176,7 @@ impl Db {
 
     pub fn get_task(&self, task_id: i64) -> rusqlite::Result<Option<Task>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, parent_id, title, status, priority, tags, description FROM tasks WHERE id = ?1",
+            "SELECT id, parent_id, title, status, priority, tags, description, updated_at FROM tasks WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![task_id], |row| {
             let tags_str: String = row.get(5)?;
@@ -192,6 +193,7 @@ impl Db {
                 priority: Priority::from_str(&row.get::<_, String>(4)?),
                 tags,
                 description: row.get(6)?,
+                updated_at: row.get(7)?,
             })
         })?;
         match rows.next() {
@@ -203,7 +205,7 @@ impl Db {
 
     pub fn all_tasks(&self) -> rusqlite::Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, parent_id, title, status, priority, tags, description FROM tasks ORDER BY parent_id NULLS FIRST, position, id",
+            "SELECT id, parent_id, title, status, priority, tags, description, updated_at FROM tasks ORDER BY parent_id NULLS FIRST, position, id",
         )?;
         let tasks = stmt
             .query_map([], |row| {
@@ -221,6 +223,7 @@ impl Db {
                     priority: Priority::from_str(&row.get::<_, String>(4)?),
                     tags,
                     description: row.get(6)?,
+                    updated_at: row.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
