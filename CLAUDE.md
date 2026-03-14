@@ -7,15 +7,17 @@ Terminal-native developer control plane built with Rust + Ratatui.
 ```bash
 cargo build          # Compile
 cargo run            # Run TUI (creates DB on first run)
+cargo run -- mcp     # Run MCP server (JSON-RPC over stdio)
 cargo watch -x run   # Auto-reload on code changes (requires cargo-watch)
 ```
 
 ## Architecture
 
-Two-file app with Elm-like architecture:
+Three-file app with Elm-like architecture:
 
 - `src/main.rs` — TUI app: state (`App` struct), input handling (`handle_key`/`handle_mouse`), rendering (`ui()`)
 - `src/db.rs` — SQLite layer: schema, migrations, CRUD, tree queries (recursive CTEs)
+- `src/mcp.rs` — MCP server: JSON-RPC over stdio, exposes task CRUD to Claude Code
 
 ## Key Patterns
 
@@ -53,6 +55,18 @@ sessions:
   created_at  TEXT NOT NULL DEFAULT datetime('now')
 ```
 
+## MCP Server
+
+Run `cli-todo mcp` (or `cargo run -- mcp`) to start a JSON-RPC/MCP server on stdin/stdout. Claude Code uses this to read/write tasks in the shared SQLite DB.
+
+### MCP Tools
+
+- `list_tasks` — all tasks, optional `status` and `parent_id` filters
+- `get_task` — single task by ID with descendant/session counts
+- `add_task` — create task (title required, optional priority/tags/description/parent_id)
+- `update_task` — update any fields (title/status/priority/tags/description/parent_id)
+- `delete_task` — delete by ID (cascades to children)
+
 ## Gotchas
 
 - Rust 2024 edition — requires rustc 1.85+
@@ -64,6 +78,5 @@ sessions:
 - **Language:** Rust
 - **TUI:** Ratatui + Crossterm
 - **Storage:** SQLite via rusqlite (bundled)
-- **CLI parsing:** TBD (clap)
-- **MCP server:** TBD (likely a separate binary or mode)
+- **MCP server:** Built-in (`cargo run -- mcp`), JSON-RPC over stdio
 - **Embeddings:** TBD

@@ -1,7 +1,9 @@
 use rusqlite::{Connection, params};
+use serde::{Serialize, Deserialize};
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Status {
     Todo,
     InProgress,
@@ -47,7 +49,8 @@ impl Status {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Priority {
     Low,
     Medium,
@@ -84,7 +87,7 @@ impl Priority {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 pub struct Task {
     pub id: i64,
     pub parent_id: Option<i64>,
@@ -144,6 +147,34 @@ impl Db {
         )?;
 
         Ok(())
+    }
+
+    pub fn get_task(&self, task_id: i64) -> rusqlite::Result<Option<Task>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, parent_id, title, status, priority, tags, description FROM tasks WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![task_id], |row| {
+            let tags_str: String = row.get(5)?;
+            let tags: Vec<String> = if tags_str.is_empty() {
+                vec![]
+            } else {
+                tags_str.split(',').map(|s| s.trim().to_string()).collect()
+            };
+            Ok(Task {
+                id: row.get(0)?,
+                parent_id: row.get(1)?,
+                title: row.get(2)?,
+                status: Status::from_str(&row.get::<_, String>(3)?),
+                priority: Priority::from_str(&row.get::<_, String>(4)?),
+                tags,
+                description: row.get(6)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(task)) => Ok(Some(task)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
     }
 
     pub fn all_tasks(&self) -> rusqlite::Result<Vec<Task>> {
@@ -213,6 +244,34 @@ impl Db {
             params![status.as_str(), task_id],
         )?;
         Ok(())
+    }
+
+    pub fn update_task(
+        &self,
+        task_id: i64,
+        title: Option<&str>,
+        status: Option<Status>,
+        priority: Option<Priority>,
+        tags: Option<&[String]>,
+        description: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        let current = match self.get_task(task_id)? {
+            Some(t) => t,
+            None => return Ok(false),
+        };
+        let title = title.unwrap_or(&current.title);
+        let status = status.unwrap_or(current.status);
+        let priority = priority.unwrap_or(current.priority);
+        let tags_str = match tags {
+            Some(t) => t.join(","),
+            None => current.tags.join(","),
+        };
+        let description = description.unwrap_or(&current.description);
+        self.conn.execute(
+            "UPDATE tasks SET title=?1, status=?2, priority=?3, tags=?4, description=?5, updated_at=datetime('now') WHERE id=?6",
+            params![title, status.as_str(), priority.as_str(), tags_str, description, task_id],
+        )?;
+        Ok(true)
     }
 
     pub fn delete_task(&self, task_id: i64) -> rusqlite::Result<()> {

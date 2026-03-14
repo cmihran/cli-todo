@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cli-todo": {
+      "command": "cargo",
+      "args": ["run", "--manifest-path", "/home/charl/dev/cli-todo/Cargo.toml", "--", "mcp"]
+    }
+  }
+}

@@ -1,4 +1,5 @@
 mod db;
+mod mcp;
 
 use crate::db::{Db, Priority, Status, Task};
 use crossterm::{
@@ -1624,6 +1625,11 @@ fn render_delete_confirm(f: &mut Frame, app: &App) {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 fn main() -> io::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("mcp") {
+        mcp::run();
+        return Ok(());
+    }
+
     let db = Db::open().expect("failed to open database");
 
     stdout()
