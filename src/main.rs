@@ -269,6 +269,10 @@ struct App {
     // Animation tick counter for spinner effects
     animation_tick: usize,
     last_animation: std::time::Instant,
+    // Full-text search
+    search_mode: bool,
+    search_query: String,
+    search_cursor: usize,
 }
 
 // ── App logic ───────────────────────────────────────────────────────────────
@@ -325,6 +329,9 @@ impl App {
             active_session_ids: HashSet::new(),
             animation_tick: 0,
             last_animation: std::time::Instant::now(),
+            search_mode: false,
+            search_query: String::new(),
+            search_cursor: 0,
         };
         app.reload_tasks();
         app.refresh_active_sessions();
@@ -365,6 +372,7 @@ impl App {
                 None => true,
                 Some(tag) => tv.task.tags.contains(tag),
             })
+            .filter(|tv| self.matches_search(tv))
             .collect()
     }
 
@@ -464,7 +472,9 @@ impl App {
     // ── Display rows ────────────────────────────────────────────────────────
 
     fn build_display_rows(&self) -> Vec<DisplayRow> {
-        let has_filter = self.active_tab != ActiveTab::All || self.tag_filter.is_some();
+        let has_filter = self.active_tab != ActiveTab::All
+            || self.tag_filter.is_some()
+            || !self.search_query.is_empty();
 
         if self.group_by == GroupBy::None {
             let tree = self.tree_walk();
@@ -477,6 +487,7 @@ impl App {
                             None => true,
                             Some(tag) => tv.task.tags.contains(tag),
                         }
+                        && self.matches_search(tv)
                 })
                 .map(|(idx, depth)| DisplayRow::Task {
                     idx,
@@ -497,6 +508,7 @@ impl App {
                         None => true,
                         Some(tag) => tv.task.tags.contains(tag),
                     }
+                    && self.matches_search(tv)
             })
             .map(|(i, _)| i)
             .collect();
@@ -565,6 +577,16 @@ impl App {
             .iter()
             .position(|r| matches!(r, DisplayRow::Task { .. }));
         self.table_state.select(first.or(Some(0)));
+    }
+
+    /// Check if a task matches the current search query (title or description).
+    fn matches_search(&self, tv: &TaskView) -> bool {
+        if self.search_query.is_empty() {
+            return true;
+        }
+        let query = self.search_query.to_lowercase();
+        tv.task.title.to_lowercase().contains(&query)
+            || tv.task.description.to_lowercase().contains(&query)
     }
 
     fn all_tags(&self) -> Vec<String> {
@@ -668,6 +690,10 @@ impl App {
     // ── Key handling ────────────────────────────────────────────────────────
 
     fn handle_key(&mut self, code: KeyCode) {
+        if self.search_mode {
+            self.handle_search_key(code);
+            return;
+        }
         if self.edit_mode {
             self.handle_edit_key(code);
             return;
@@ -710,7 +736,20 @@ impl App {
         let display = self.build_display_rows();
         let display_len = display.len();
         match code {
-            KeyCode::Char('q') | KeyCode::Esc => {
+            KeyCode::Esc => {
+                if !self.search_query.is_empty() {
+                    self.search_query.clear();
+                    self.select_first_task();
+                } else {
+                    let running = self.claude_panes.values().any(|p| !p.exited);
+                    if running {
+                        self.confirm_quit = true;
+                    } else {
+                        self.quit = true;
+                    }
+                }
+            }
+            KeyCode::Char('q') => {
                 let running = self.claude_panes.values().any(|p| !p.exited);
                 if running {
                     self.confirm_quit = true;
@@ -991,7 +1030,58 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('/') => {
+                self.search_mode = true;
+                self.search_query.clear();
+                self.search_cursor = 0;
+            }
             KeyCode::Char('?') => self.show_help = true,
+            _ => {}
+        }
+    }
+
+    fn handle_search_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.search_mode = false;
+                self.search_query.clear();
+                self.select_first_task();
+            }
+            KeyCode::Enter => {
+                self.search_mode = false;
+                // Keep the search query active as a filter
+                self.select_first_task();
+            }
+            KeyCode::Backspace => {
+                if self.search_cursor > 0 {
+                    self.search_cursor -= 1;
+                    self.search_query.remove(self.search_cursor);
+                    self.select_first_task();
+                }
+            }
+            KeyCode::Delete => {
+                if self.search_cursor < self.search_query.len() {
+                    self.search_query.remove(self.search_cursor);
+                    self.select_first_task();
+                }
+            }
+            KeyCode::Left => {
+                if self.search_cursor > 0 {
+                    self.search_cursor -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if self.search_cursor < self.search_query.len() {
+                    self.search_cursor += 1;
+                }
+            }
+            KeyCode::Home => self.search_cursor = 0,
+            KeyCode::End => self.search_cursor = self.search_query.len(),
+            KeyCode::Char(c) => {
+                self.search_query.insert(self.search_cursor, c);
+                self.search_cursor += 1;
+                self.select_first_task();
+            }
             _ => {}
         }
     }
@@ -1421,6 +1511,8 @@ fn ui(f: &mut Frame, app: &mut App) {
         render_edit_bar(f, outer[3], app);
     } else if app.input_mode {
         render_input_bar(f, outer[3], app);
+    } else if app.search_mode {
+        render_search_bar(f, outer[3], app);
     } else {
         render_status_bar(f, outer[3], app);
     }
@@ -1487,6 +1579,18 @@ fn render_header(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         ));
         title.push(Span::styled(
             format!(" {} ", tag),
+            Style::default()
+                .fg(Color::Cyan)
+                .bg(Color::Rgb(20, 40, 50)),
+        ));
+    }
+    if !app.search_query.is_empty() {
+        title.push(Span::styled(
+            "  search: ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        title.push(Span::styled(
+            format!(" {} ", app.search_query),
             Style::default()
                 .fg(Color::Cyan)
                 .bg(Color::Rgb(20, 40, 50)),
@@ -2078,6 +2182,8 @@ fn render_status_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             Span::styled(" group ", label_style),
             Span::styled(" o ", key_style),
             Span::styled(" sort ", label_style),
+            Span::styled(" / ", key_style),
+            Span::styled(" search ", label_style),
             Span::styled(" a ", key_style),
             Span::styled(" add ", label_style),
             Span::styled(" e ", key_style),
@@ -2144,6 +2250,28 @@ fn render_edit_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     #[allow(clippy::cast_possible_truncation)]
     f.set_cursor_position((
         area.x + label.len() as u16 + app.edit_cursor as u16,
+        area.y,
+    ));
+}
+
+fn render_search_bar(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let label = "/";
+    let bar = Line::from(vec![
+        Span::styled(
+            label,
+            Style::default().fg(Color::Cyan).bold(),
+        ),
+        Span::styled(&app.search_query, Style::default().fg(Color::White)),
+        Span::styled("█", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "  (Enter to filter, Esc to clear)",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(bar), area);
+    #[allow(clippy::cast_possible_truncation)]
+    f.set_cursor_position((
+        area.x + label.len() as u16 + app.search_cursor as u16,
         area.y,
     ));
 }
@@ -2236,7 +2364,7 @@ fn render_edit_picker(f: &mut Frame, app: &mut App) {
 fn render_help_popup(f: &mut Frame) {
     let area = f.area();
     let popup_width = 54u16.min(area.width.saturating_sub(4));
-    let popup_height = 32u16.min(area.height.saturating_sub(4));
+    let popup_height = 33u16.min(area.height.saturating_sub(4));
     let popup_area = ratatui::layout::Rect {
         x: (area.width.saturating_sub(popup_width)) / 2,
         y: (area.height.saturating_sub(popup_height)) / 2,
@@ -2295,6 +2423,10 @@ fn render_help_popup(f: &mut Frame) {
         Line::from(vec![
             Span::styled("  o          ", Style::default().fg(Color::Cyan)),
             Span::styled("Cycle sort order", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  /          ", Style::default().fg(Color::Cyan)),
+            Span::styled("Search tasks", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
             Span::styled("  t          ", Style::default().fg(Color::Cyan)),
