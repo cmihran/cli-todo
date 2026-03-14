@@ -175,6 +175,7 @@ impl SortBy {
         match s {
             "status" => SortBy::Status,
             "alphabetical" => SortBy::Alphabetical,
+            "last_modified" => SortBy::LastModified,
             _ => SortBy::Manual,
         }
     }
@@ -184,6 +185,7 @@ impl SortBy {
             SortBy::Manual => "manual",
             SortBy::Status => "status",
             SortBy::Alphabetical => "alphabetical",
+            SortBy::LastModified => "last_modified",
         }
     }
 }
@@ -494,12 +496,48 @@ impl App {
         map
     }
 
+    /// Compute the effective modified time for each task index — the max of
+    /// its own `updated_at` and all its descendants' `updated_at`.
+    fn effective_modified(&self, children: &HashMap<Option<i64>, Vec<usize>>) -> Vec<String> {
+        let mut result: Vec<String> = self.tasks.iter().map(|tv| tv.task.updated_at.clone()).collect();
+
+        fn propagate(
+            parent_id: Option<i64>,
+            children: &HashMap<Option<i64>, Vec<usize>>,
+            tasks: &[TaskView],
+            result: &mut Vec<String>,
+        ) -> String {
+            let mut best = String::new();
+            if let Some(kids) = children.get(&parent_id) {
+                for &idx in kids {
+                    let child_id = tasks[idx].task.id;
+                    let child_best = propagate(Some(child_id), children, tasks, result);
+                    if result[idx] < child_best {
+                        result[idx] = child_best.clone();
+                    }
+                    if best < result[idx] {
+                        best = result[idx].clone();
+                    }
+                }
+            }
+            best
+        }
+
+        propagate(None, children, &self.tasks, &mut result);
+        result
+    }
+
     /// Depth-first traversal of the task tree, respecting collapsed state and sort order.
     fn tree_walk(&self) -> Vec<(usize, usize)> {
         let children = self.children_map();
         let mut result = Vec::new();
         let mut visited = HashSet::new();
         let sort_by = self.sort_by;
+        let effective_mod = if sort_by == SortBy::LastModified {
+            self.effective_modified(&children)
+        } else {
+            vec![]
+        };
 
         fn walk(
             parent_id: Option<i64>,
@@ -510,6 +548,7 @@ impl App {
             visited: &mut HashSet<i64>,
             result: &mut Vec<(usize, usize)>,
             sort_by: SortBy,
+            effective_mod: &[String],
         ) {
             if let Some(kids) = children.get(&parent_id) {
                 let sorted: Vec<usize> = match sort_by {
@@ -537,7 +576,7 @@ impl App {
                     SortBy::LastModified => {
                         let mut v = kids.clone();
                         v.sort_by(|&a, &b| {
-                            tasks[b].task.updated_at.cmp(&tasks[a].task.updated_at)
+                            effective_mod[b].cmp(&effective_mod[a])
                         });
                         v
                     }
@@ -558,6 +597,7 @@ impl App {
                             visited,
                             result,
                             sort_by,
+                            effective_mod,
                         );
                     }
                 }
@@ -573,6 +613,7 @@ impl App {
             &mut visited,
             &mut result,
             sort_by,
+            &effective_mod,
         );
         result
     }
@@ -1883,6 +1924,47 @@ fn tree_prefix(display: &[DisplayRow], row_index: usize) -> String {
 }
 
 /// Truncate a string to fit within `max_width` display columns, appending "…" if truncated.
+/// Format a SQLite datetime string (e.g. "2026-03-14 10:30:00") as a relative time.
+fn format_relative_time(dt: &str) -> String {
+    // Parse "YYYY-MM-DD HH:MM:SS" manually
+    let parts: Vec<&str> = dt.split(|c| c == '-' || c == ' ' || c == ':').collect();
+    if parts.len() < 6 {
+        return dt.to_string();
+    }
+    let (Ok(y), Ok(mo), Ok(d), Ok(h), Ok(mi), Ok(s)) = (
+        parts[0].parse::<i64>(), parts[1].parse::<u32>(), parts[2].parse::<u32>(),
+        parts[3].parse::<u32>(), parts[4].parse::<u32>(), parts[5].parse::<u32>(),
+    ) else {
+        return dt.to_string();
+    };
+    // Days from epoch using a simplified calculation (good enough for relative display)
+    let days_from_epoch = |yr: i64, mon: u32, day: u32| -> i64 {
+        let mut y = yr;
+        let mut m = mon as i64;
+        if m <= 2 { y -= 1; m += 12; }
+        365 * y + y / 4 - y / 100 + y / 400 + (153 * (m - 3) + 2) / 5 + day as i64 - 719469
+    };
+    let parsed_secs = days_from_epoch(y, mo, d) * 86400 + h as i64 * 3600 + mi as i64 * 60 + s as i64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let diff = now - parsed_secs;
+    if diff < 60 {
+        "just now".to_string()
+    } else if diff < 3600 {
+        format!("{}m ago", diff / 60)
+    } else if diff < 86400 {
+        format!("{}h ago", diff / 3600)
+    } else if diff < 604800 {
+        format!("{}d ago", diff / 86400)
+    } else {
+        let months = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        format!("{} {}", months[mo as usize], d)
+    }
+}
+
 fn truncate_to_width(s: &str, max_width: usize) -> String {
     let width = s.width();
     if width <= max_width {
@@ -1913,8 +1995,8 @@ fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
 
     // Compute available width for the title column:
     // inner = area.width - border_right(1) - padding_left(1) - padding_right(1)
-    // title_width = inner - fixed_columns(2+4+6+14+10) - column_gaps(5×1)
-    let title_col_width = (area.width as usize).saturating_sub(44);
+    // title_width = inner - fixed_columns(2+4+6+14+10+14) - column_gaps(6×1)
+    let title_col_width = (area.width as usize).saturating_sub(58);
 
     let header = Row::new(vec![
         Cell::from(" "),
@@ -1922,6 +2004,7 @@ fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
         Cell::from("Task"),
         Cell::from("Priority"),
         Cell::from("Tags"),
+        Cell::from("Modified"),
         Cell::from("Sessions"),
     ])
     .style(
@@ -1946,6 +2029,7 @@ fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     )),
+                    Cell::from(""),
                     Cell::from(""),
                     Cell::from(""),
                     Cell::from(""),
@@ -2013,12 +2097,18 @@ fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
                     Style::default().fg(Color::DarkGray),
                 ));
 
+                let modified_cell = Cell::from(Span::styled(
+                    format_relative_time(&task.updated_at),
+                    Style::default().fg(Color::DarkGray),
+                ));
+
                 Row::new(vec![
                     status_cell,
                     id_cell,
                     title_cell,
                     priority_cell,
                     tags_cell,
+                    modified_cell,
                     session_cell,
                 ])
                 .height(1)
@@ -2033,6 +2123,7 @@ fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
             Constraint::Length(4),
             Constraint::Min(20),
             Constraint::Length(6),
+            Constraint::Length(14),
             Constraint::Length(14),
             Constraint::Length(10),
         ],
