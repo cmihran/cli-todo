@@ -788,6 +788,31 @@ impl App {
         set.into_iter().map(String::from).collect()
     }
 
+    /// After modifying a task, ensure the cursor follows it.
+    /// If the task is no longer visible in the current tab, switch to the
+    /// appropriate tab. Then reposition the cursor on the task.
+    fn follow_task(&mut self, task_id: i64) {
+        // Check if the task is still visible in the current tab
+        if let Some(tv) = self.tasks.iter().find(|tv| tv.task.id == task_id) {
+            if !self.active_tab.filter(tv.task.status) {
+                // Switch to the tab that contains this status
+                self.active_tab = match tv.task.status {
+                    Status::Todo | Status::InProgress => ActiveTab::Active,
+                    Status::InReview => ActiveTab::InReview,
+                    Status::Blocked => ActiveTab::Blocked,
+                    Status::Done => ActiveTab::Done,
+                };
+            }
+        }
+        // Rebuild display and find the task's new position
+        let display = self.build_display_rows();
+        if let Some(pos) = display.iter().position(|dr| {
+            matches!(dr, DisplayRow::Task { idx, .. } if self.tasks[*idx].task.id == task_id)
+        }) {
+            self.table_state.select(Some(pos));
+        }
+    }
+
     // ── Actions ─────────────────────────────────────────────────────────────
 
     fn delete_selected(&mut self) {
@@ -1148,6 +1173,7 @@ impl App {
                         let new_status = self.tasks[idx].task.status.next();
                         if self.db.update_status(id, new_status).is_ok() {
                             self.tasks[idx].task.status = new_status;
+                            self.follow_task(id);
                         }
                     }
                 }
@@ -1162,6 +1188,7 @@ impl App {
                         };
                         if self.db.update_status(id, new_status).is_ok() {
                             self.tasks[idx].task.status = new_status;
+                            self.follow_task(id);
                         }
                     }
                 }
@@ -1471,6 +1498,7 @@ impl App {
                                     None,
                                 );
                                 self.tasks[idx].task.priority = new_priority;
+                                self.follow_task(task_id);
                             }
                         }
                         _ => {
@@ -1541,6 +1569,7 @@ impl App {
                         EditField::Priority => unreachable!(),
                     }
                     self.reload_tasks();
+                    self.follow_task(task_id);
                 }
                 self.edit_mode = false;
                 self.edit_buffer.clear();
@@ -3177,14 +3206,9 @@ fn main() -> io::Result<()> {
             last_mtime = current_mtime;
             let selected_id = app.selected_task_view().map(|tv| tv.task.id);
             app.reload_tasks();
-            // Restore selection by task ID
+            // Restore selection by task ID, switching tabs if needed
             if let Some(id) = selected_id {
-                let display = app.build_display_rows();
-                if let Some(pos) = display.iter().position(|dr| {
-                    matches!(dr, DisplayRow::Task { idx, .. } if app.tasks[*idx].task.id == id)
-                }) {
-                    app.table_state.select(Some(pos));
-                }
+                app.follow_task(id);
             }
         }
 
