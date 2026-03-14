@@ -1594,11 +1594,6 @@ fn render_delete_confirm(f: &mut Frame, app: &App) {
 fn main() -> io::Result<()> {
     let db = Db::open().expect("failed to open database");
 
-    // Seed sample data on first run
-    if db.is_empty().unwrap_or(false) {
-        db.seed_sample_data().expect("failed to seed sample data");
-    }
-
     stdout()
         .execute(EnterAlternateScreen)?
         .execute(EnableMouseCapture)?;

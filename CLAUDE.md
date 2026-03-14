@@ -30,11 +30,40 @@ Two-file app with Elm-like architecture:
 - `rusqlite` with `bundled` feature — zero runtime dependencies
 - `PRAGMA foreign_keys = ON` — CASCADE deletes handle children/sessions
 - Migrations are idempotent (CREATE IF NOT EXISTS, ALTER TABLE ignores duplicate column errors)
-- Delete DB to re-seed: `rm ~/.local/share/cli-todo/cli-todo.db`
+- Delete DB to reset: `rm ~/.local/share/cli-todo/cli-todo.db`
+
+### Schema
+
+```
+tasks:
+  id          INTEGER PRIMARY KEY AUTOINCREMENT
+  parent_id   INTEGER REFERENCES tasks(id) ON DELETE CASCADE  -- nullable, enables nesting
+  title       TEXT NOT NULL
+  status      TEXT NOT NULL DEFAULT 'todo'        -- todo | in_progress | done | blocked
+  priority    TEXT NOT NULL DEFAULT 'medium'      -- low | medium | high | critical
+  tags        TEXT NOT NULL DEFAULT ''             -- comma-separated
+  description TEXT NOT NULL DEFAULT ''
+  created_at  TEXT NOT NULL DEFAULT datetime('now')
+  updated_at  TEXT NOT NULL DEFAULT datetime('now')
+
+sessions:
+  id          INTEGER PRIMARY KEY AUTOINCREMENT
+  task_id     INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE
+  session_id  TEXT NOT NULL
+  created_at  TEXT NOT NULL DEFAULT datetime('now')
+```
 
 ## Gotchas
 
 - Rust 2024 edition — requires rustc 1.85+
-- The app seeds sample data only when the DB is empty
 - Tree view only shows in GroupBy::None mode; grouped modes flatten to depth 0
 - When filters are active (non-All tab), tasks flatten to depth 0 to avoid orphaned children
+
+## Tech stack
+
+- **Language:** Rust
+- **TUI:** Ratatui + Crossterm
+- **Storage:** SQLite via rusqlite (bundled)
+- **CLI parsing:** TBD (clap)
+- **MCP server:** TBD (likely a separate binary or mode)
+- **Embeddings:** TBD
