@@ -163,7 +163,7 @@ impl SortBy {
 /// A row in the display list — either a group header or a task reference.
 enum DisplayRow {
     Header(String),
-    Task { idx: usize, depth: usize },
+    Task { idx: usize, depth: usize, dimmed: bool },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -482,44 +482,52 @@ impl App {
             if !has_filter {
                 return tree
                     .into_iter()
-                    .map(|(idx, depth)| DisplayRow::Task { idx, depth })
+                    .map(|(idx, depth)| DisplayRow::Task { idx, depth, dimmed: false })
                     .collect();
             }
 
-            // Filter is active — show matching tasks with adjusted depths.
-            // Effective depth = number of ancestors that also match the filter,
-            // so children of hidden parents get promoted rather than orphaned.
-            let matching_task_ids: HashSet<i64> = tree
+            // Filter is active — include matching tasks plus their ancestors
+            // for tree structure. Ancestors that don't match are shown dimmed.
+            let matches_filter = |idx: usize| -> bool {
+                let tv = &self.tasks[idx];
+                self.active_tab.filter(tv.task.status)
+                    && match &self.tag_filter {
+                        None => true,
+                        Some(tag) => tv.task.tags.contains(tag),
+                    }
+                    && self.matches_search(tv)
+            };
+
+            // Collect IDs of tasks that directly match the filter
+            let matching_ids: HashSet<i64> = tree
                 .iter()
-                .filter(|(idx, _)| {
-                    let tv = &self.tasks[*idx];
-                    self.active_tab.filter(tv.task.status)
-                        && match &self.tag_filter {
-                            None => true,
-                            Some(tag) => tv.task.tags.contains(tag),
-                        }
-                        && self.matches_search(tv)
-                })
+                .filter(|(idx, _)| matches_filter(*idx))
                 .map(|(idx, _)| self.tasks[*idx].task.id)
                 .collect();
 
+            // Also include ancestors of matching tasks (for tree structure)
+            let mut visible_ids: HashSet<i64> = matching_ids.clone();
+            for &id in &matching_ids {
+                let mut current_parent = self.tasks.iter()
+                    .find(|tv| tv.task.id == id)
+                    .and_then(|tv| tv.task.parent_id);
+                while let Some(pid) = current_parent {
+                    if !visible_ids.insert(pid) {
+                        break; // already added this ancestor chain
+                    }
+                    current_parent = self.tasks.iter()
+                        .find(|tv| tv.task.id == pid)
+                        .and_then(|tv| tv.task.parent_id);
+                }
+            }
+
             return tree
                 .into_iter()
-                .filter(|(idx, _)| matching_task_ids.contains(&self.tasks[*idx].task.id))
-                .map(|(idx, _depth)| {
-                    let mut effective_depth = 0;
-                    let mut current_parent = self.tasks[idx].task.parent_id;
-                    while let Some(pid) = current_parent {
-                        if matching_task_ids.contains(&pid) {
-                            effective_depth += 1;
-                        }
-                        if let Some(parent_tv) = self.tasks.iter().find(|tv| tv.task.id == pid) {
-                            current_parent = parent_tv.task.parent_id;
-                        } else {
-                            break;
-                        }
-                    }
-                    DisplayRow::Task { idx, depth: effective_depth }
+                .filter(|(idx, _)| visible_ids.contains(&self.tasks[*idx].task.id))
+                .map(|(idx, depth)| DisplayRow::Task {
+                    idx,
+                    depth,
+                    dimmed: !matching_ids.contains(&self.tasks[idx].task.id),
                 })
                 .collect();
         }
@@ -581,7 +589,7 @@ impl App {
             if let Some(indices) = group_map.remove(&key) {
                 rows.push(DisplayRow::Header(key));
                 for idx in indices {
-                    rows.push(DisplayRow::Task { idx, depth: 0 });
+                    rows.push(DisplayRow::Task { idx, depth: 0, dimmed: false });
                 }
             }
         }
@@ -1826,13 +1834,14 @@ fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
                 ])
                 .height(1)
             }
-            DisplayRow::Task { idx, .. } => {
+            DisplayRow::Task { idx, dimmed, .. } => {
                 let tv = &app.tasks[*idx];
                 let task = &tv.task;
+                let is_dimmed = *dimmed;
 
                 let status_cell = Cell::from(Span::styled(
                     status_icon(task.status, app.animation_tick),
-                    Style::default().fg(status_color(task.status)),
+                    Style::default().fg(if is_dimmed { Color::DarkGray } else { status_color(task.status) }),
                 ));
 
                 // Build title with tree prefix and collapse indicator
@@ -1853,12 +1862,12 @@ fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
                 let title_text = truncate_to_width(&title_text, title_col_width);
                 let title_cell = Cell::from(Span::styled(
                     title_text,
-                    Style::default().fg(Color::White),
+                    Style::default().fg(if is_dimmed { Color::DarkGray } else { Color::White }),
                 ));
 
                 let priority_cell = Cell::from(Span::styled(
                     task.priority.label(),
-                    Style::default().fg(priority_color(task.priority)),
+                    Style::default().fg(if is_dimmed { Color::DarkGray } else { priority_color(task.priority) }),
                 ));
                 let tags_cell = Cell::from(Span::styled(
                     task.tags.join(", "),

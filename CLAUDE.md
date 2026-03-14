@@ -75,7 +75,7 @@ Run `cli-todo mcp` (or `cargo run -- mcp`) to start a JSON-RPC/MCP server on std
 
 - Rust 2024 edition — requires rustc 1.85+
 - Tree view only shows in GroupBy::None mode; grouped modes flatten to depth 0
-- When filters are active (non-All tab), tree nesting is preserved; children of hidden parents are promoted to the nearest visible ancestor's depth
+- When filters are active (non-All tab), tree nesting is preserved; ancestor tasks that don't match the filter are included as dimmed structural rows
 
 ## Tech stack
 
