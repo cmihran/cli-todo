@@ -307,8 +307,8 @@ impl EditField {
 #[derive(Clone, Copy, PartialEq)]
 enum ActiveTab {
     All,
+    NotStarted,
     Active,
-    InReview,
     Blocked,
     Done,
 }
@@ -317,8 +317,8 @@ impl ActiveTab {
     fn index(self) -> usize {
         match self {
             ActiveTab::All => 0,
-            ActiveTab::Active => 1,
-            ActiveTab::InReview => 2,
+            ActiveTab::NotStarted => 1,
+            ActiveTab::Active => 2,
             ActiveTab::Blocked => 3,
             ActiveTab::Done => 4,
         }
@@ -327,17 +327,26 @@ impl ActiveTab {
     fn filter(self, status: Status) -> bool {
         match self {
             ActiveTab::All => true,
-            ActiveTab::Active => status == Status::InProgress || status == Status::Todo,
-            ActiveTab::InReview => status == Status::InReview,
+            ActiveTab::NotStarted => status == Status::Todo,
+            ActiveTab::Active => status == Status::InProgress || status == Status::InReview,
             ActiveTab::Blocked => status == Status::Blocked,
             ActiveTab::Done => status == Status::Done,
         }
     }
 
+    fn tab_for_status(status: Status) -> Self {
+        match status {
+            Status::Todo => ActiveTab::NotStarted,
+            Status::InProgress | Status::InReview => ActiveTab::Active,
+            Status::Blocked => ActiveTab::Blocked,
+            Status::Done => ActiveTab::Done,
+        }
+    }
+
     fn from_str(s: &str) -> Self {
         match s {
+            "not_started" => ActiveTab::NotStarted,
             "active" => ActiveTab::Active,
-            "in_review" => ActiveTab::InReview,
             "blocked" => ActiveTab::Blocked,
             "done" => ActiveTab::Done,
             _ => ActiveTab::All,
@@ -347,8 +356,8 @@ impl ActiveTab {
     fn as_str(self) -> &'static str {
         match self {
             ActiveTab::All => "all",
+            ActiveTab::NotStarted => "not_started",
             ActiveTab::Active => "active",
-            ActiveTab::InReview => "in_review",
             ActiveTab::Blocked => "blocked",
             ActiveTab::Done => "done",
         }
@@ -885,13 +894,7 @@ impl App {
         // Check if the task is still visible in the current tab
         if let Some(tv) = self.tasks.iter().find(|tv| tv.task.id == task_id) {
             if !self.active_tab.filter(tv.task.status) {
-                // Switch to the tab that contains this status
-                self.active_tab = match tv.task.status {
-                    Status::Todo | Status::InProgress => ActiveTab::Active,
-                    Status::InReview => ActiveTab::InReview,
-                    Status::Blocked => ActiveTab::Blocked,
-                    Status::Done => ActiveTab::Done,
-                };
+                self.active_tab = ActiveTab::tab_for_status(tv.task.status);
             }
         }
         // Rebuild display and find the task's new position
@@ -1090,9 +1093,9 @@ impl App {
             }
             KeyCode::Tab => {
                 self.active_tab = match self.active_tab {
-                    ActiveTab::All => ActiveTab::Active,
-                    ActiveTab::Active => ActiveTab::InReview,
-                    ActiveTab::InReview => ActiveTab::Blocked,
+                    ActiveTab::All => ActiveTab::NotStarted,
+                    ActiveTab::NotStarted => ActiveTab::Active,
+                    ActiveTab::Active => ActiveTab::Blocked,
                     ActiveTab::Blocked => ActiveTab::Done,
                     ActiveTab::Done => ActiveTab::All,
                 };
@@ -1101,9 +1104,9 @@ impl App {
             KeyCode::BackTab => {
                 self.active_tab = match self.active_tab {
                     ActiveTab::All => ActiveTab::Done,
-                    ActiveTab::Active => ActiveTab::All,
-                    ActiveTab::InReview => ActiveTab::Active,
-                    ActiveTab::Blocked => ActiveTab::InReview,
+                    ActiveTab::NotStarted => ActiveTab::All,
+                    ActiveTab::Active => ActiveTab::NotStarted,
+                    ActiveTab::Blocked => ActiveTab::Active,
                     ActiveTab::Done => ActiveTab::Blocked,
                 };
                 self.select_first_task();
@@ -1721,8 +1724,8 @@ impl App {
                         if x >= offset && x < offset + tab_width {
                             self.active_tab = match i {
                                 0 => ActiveTab::All,
-                                1 => ActiveTab::Active,
-                                2 => ActiveTab::InReview,
+                                1 => ActiveTab::NotStarted,
+                                2 => ActiveTab::Active,
                                 3 => ActiveTab::Blocked,
                                 4 => ActiveTab::Done,
                                 _ => self.active_tab,
@@ -1768,19 +1771,20 @@ impl App {
         vec![
             format!("All ({})", self.tasks.len()),
             format!(
+                "Not Started ({})",
+                self.tasks
+                    .iter()
+                    .filter(|tv| tv.task.status == Status::Todo)
+                    .count()
+            ),
+            format!(
                 "Active ({})",
                 self.tasks
                     .iter()
                     .filter(
-                        |tv| tv.task.status == Status::InProgress || tv.task.status == Status::Todo
+                        |tv| tv.task.status == Status::InProgress
+                            || tv.task.status == Status::InReview
                     )
-                    .count()
-            ),
-            format!(
-                "Review ({})",
-                self.tasks
-                    .iter()
-                    .filter(|tv| tv.task.status == Status::InReview)
                     .count()
             ),
             format!(
@@ -1965,19 +1969,20 @@ fn render_tabs(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let tab_titles: Vec<Line> = vec![
         format!(" All ({}) ", app.tasks.len()),
         format!(
+            " Not Started ({}) ",
+            app.tasks
+                .iter()
+                .filter(|tv| tv.task.status == Status::Todo)
+                .count()
+        ),
+        format!(
             " Active ({}) ",
             app.tasks
                 .iter()
                 .filter(
-                    |tv| tv.task.status == Status::InProgress || tv.task.status == Status::Todo
+                    |tv| tv.task.status == Status::InProgress
+                        || tv.task.status == Status::InReview
                 )
-                .count()
-        ),
-        format!(
-            " Review ({}) ",
-            app.tasks
-                .iter()
-                .filter(|tv| tv.task.status == Status::InReview)
                 .count()
         ),
         format!(
