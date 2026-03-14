@@ -53,6 +53,52 @@ fn priority_color(p: Priority) -> Color {
     }
 }
 
+// ── Active session detection ─────────────────────────────────────────────────
+
+/// Scan /proc for running `claude` processes and return their session IDs.
+fn detect_active_session_ids() -> HashSet<String> {
+    let mut active = HashSet::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return active;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let cmdline_path = entry.path().join("cmdline");
+        let Ok(data) = std::fs::read(&cmdline_path) else {
+            continue;
+        };
+        let args: Vec<String> = data
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).to_string())
+            .collect();
+        if args.is_empty() {
+            continue;
+        }
+        // Check if any of the first few args indicate a claude process
+        let has_claude = args.iter().take(3).any(|a| {
+            a.rsplit('/').next().unwrap_or(a) == "claude"
+        });
+        if !has_claude {
+            continue;
+        }
+        // Extract session IDs from --session-id or --resume flags
+        let mut i = 0;
+        while i < args.len() - 1 {
+            if args[i] == "--session-id" || args[i] == "--resume" {
+                active.insert(args[i + 1].clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    active
+}
+
 // ── App types ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
@@ -145,6 +191,8 @@ struct App {
     // Layout areas for mouse hit-testing
     table_area: ratatui::layout::Rect,
     tab_area: ratatui::layout::Rect,
+    // Active Claude session IDs (detected from running processes)
+    active_session_ids: HashSet<String>,
 }
 
 // ── App logic ───────────────────────────────────────────────────────────────
@@ -176,9 +224,15 @@ impl App {
             input_parent_id: None,
             table_area: zero_rect,
             tab_area: zero_rect,
+            active_session_ids: HashSet::new(),
         };
         app.reload_tasks();
+        app.refresh_active_sessions();
         app
+    }
+
+    fn refresh_active_sessions(&mut self) {
+        self.active_session_ids = detect_active_session_ids();
     }
 
     fn reload_tasks(&mut self) {
@@ -1068,19 +1122,22 @@ fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
                     task.tags.join(", "),
                     Style::default().fg(Color::DarkGray),
                 ));
-                let session_count = if tv.session_count == 0 {
+                let has_active = tv.sessions.iter().any(|s| app.active_session_ids.contains(s));
+                let session_display = if has_active {
+                    format!("▶ {}", tv.session_count)
+                } else if tv.session_count == 0 {
                     String::from("—")
                 } else {
                     format!("{}", tv.session_count)
                 };
-                let session_cell = Cell::from(Span::styled(
-                    session_count,
-                    if tv.session_count == 0 {
-                        Style::default().fg(Color::DarkGray)
-                    } else {
-                        Style::default().fg(Color::Magenta)
-                    },
-                ));
+                let session_style = if has_active {
+                    Style::default().fg(Color::Green)
+                } else if tv.session_count == 0 {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Magenta)
+                };
+                let session_cell = Cell::from(Span::styled(session_display, session_style));
 
                 Row::new(vec![
                     status_cell,
@@ -1250,9 +1307,10 @@ fn render_detail_panel(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     }
 
     // Claude sessions
+    let any_active = tv.sessions.iter().any(|s| app.active_session_ids.contains(s));
     lines.push(Line::from(Span::styled(
-        "claude sessions",
-        Style::default().fg(Color::DarkGray),
+        if any_active { "claude sessions (active)" } else { "claude sessions" },
+        Style::default().fg(if any_active { Color::Green } else { Color::DarkGray }),
     )));
     if tv.sessions.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -1261,9 +1319,15 @@ fn render_detail_panel(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         )));
     } else {
         for session in &tv.sessions {
+            let is_active = app.active_session_ids.contains(session);
+            let (icon, color) = if is_active {
+                ("▶", Color::Green)
+            } else {
+                ("▸", Color::Magenta)
+            };
             lines.push(Line::from(vec![
-                Span::styled("  ▸ ", Style::default().fg(Color::Magenta)),
-                Span::styled(session.as_str(), Style::default().fg(Color::Magenta)),
+                Span::styled(format!("  {} ", icon), Style::default().fg(color)),
+                Span::styled(session.as_str(), Style::default().fg(color)),
             ]));
         }
     }
@@ -1645,6 +1709,7 @@ fn main() -> io::Result<()> {
     let mut last_mtime = std::fs::metadata(&db_path)
         .and_then(|m| m.modified())
         .ok();
+    let mut last_session_check = std::time::Instant::now();
 
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
@@ -1680,6 +1745,12 @@ fn main() -> io::Result<()> {
                     app.table_state.select(Some(pos));
                 }
             }
+        }
+
+        // Refresh active Claude session detection every 2 seconds
+        if last_session_check.elapsed() >= std::time::Duration::from_secs(2) {
+            app.refresh_active_sessions();
+            last_session_check = std::time::Instant::now();
         }
 
         if app.quit {
