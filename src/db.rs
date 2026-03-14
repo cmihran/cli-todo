@@ -171,6 +171,14 @@ impl Db {
             ) WHERE position = 0;",
         )?;
 
+        // Migration: view_state key-value table for persisting TUI preferences
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS view_state (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
+        )?;
+
         Ok(())
     }
 
@@ -353,6 +361,29 @@ impl Db {
         self.conn.execute(
             "UPDATE tasks SET position = ?1, updated_at = datetime('now') WHERE id = ?2",
             params![pos_a, task_b],
+        )?;
+        Ok(())
+    }
+
+    // ── View state persistence ─────────────────────────────────────────────
+
+    pub fn get_view_state(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT value FROM view_state WHERE key = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![key], |row| row.get(0))?;
+        match rows.next() {
+            Some(Ok(v)) => Ok(Some(v)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_view_state(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO view_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
         )?;
         Ok(())
     }

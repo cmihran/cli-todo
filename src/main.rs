@@ -133,6 +133,15 @@ impl GroupBy {
             GroupBy::Tag => GroupBy::None,
         }
     }
+
+    fn from_str(s: &str) -> Self {
+        match s {
+            "status" => GroupBy::Status,
+            "priority" => GroupBy::Priority,
+            "tag" => GroupBy::Tag,
+            _ => GroupBy::None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -159,6 +168,22 @@ impl SortBy {
             SortBy::Status => SortBy::Alphabetical,
             SortBy::Alphabetical => SortBy::LastModified,
             SortBy::LastModified => SortBy::Manual,
+        }
+    }
+
+    fn from_str(s: &str) -> Self {
+        match s {
+            "status" => SortBy::Status,
+            "alphabetical" => SortBy::Alphabetical,
+            _ => SortBy::Manual,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            SortBy::Manual => "manual",
+            SortBy::Status => "status",
+            SortBy::Alphabetical => "alphabetical",
         }
     }
 }
@@ -219,6 +244,26 @@ impl ActiveTab {
             ActiveTab::InReview => status == Status::InReview,
             ActiveTab::Blocked => status == Status::Blocked,
             ActiveTab::Done => status == Status::Done,
+        }
+    }
+
+    fn from_str(s: &str) -> Self {
+        match s {
+            "active" => ActiveTab::Active,
+            "in_review" => ActiveTab::InReview,
+            "blocked" => ActiveTab::Blocked,
+            "done" => ActiveTab::Done,
+            _ => ActiveTab::All,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            ActiveTab::All => "all",
+            ActiveTab::Active => "active",
+            ActiveTab::InReview => "in_review",
+            ActiveTab::Blocked => "blocked",
+            ActiveTab::Done => "done",
         }
     }
 }
@@ -337,8 +382,67 @@ impl App {
             search_cursor: 0,
         };
         app.reload_tasks();
+        app.restore_view_state();
         app.refresh_active_sessions();
         app
+    }
+
+    fn save_view_state(&self) {
+        let _ = self.db.set_view_state("active_tab", self.active_tab.as_str());
+        let _ = self.db.set_view_state("group_by", self.group_by.label());
+        let _ = self.db.set_view_state("sort_by", self.sort_by.as_str());
+        let _ = self.db.set_view_state("show_detail", if self.show_detail { "1" } else { "0" });
+        let _ = self.db.set_view_state(
+            "tag_filter",
+            self.tag_filter.as_deref().unwrap_or(""),
+        );
+        let collapsed_str: String = self
+            .collapsed
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = self.db.set_view_state("collapsed", &collapsed_str);
+        // Save selected task ID so we can restore cursor position
+        if let Some(tv) = self.selected_task_view() {
+            let _ = self.db.set_view_state("selected_task_id", &tv.task.id.to_string());
+        }
+    }
+
+    fn restore_view_state(&mut self) {
+        if let Ok(Some(v)) = self.db.get_view_state("active_tab") {
+            self.active_tab = ActiveTab::from_str(&v);
+        }
+        if let Ok(Some(v)) = self.db.get_view_state("group_by") {
+            self.group_by = GroupBy::from_str(&v);
+        }
+        if let Ok(Some(v)) = self.db.get_view_state("sort_by") {
+            self.sort_by = SortBy::from_str(&v);
+        }
+        if let Ok(Some(v)) = self.db.get_view_state("show_detail") {
+            self.show_detail = v == "1";
+        }
+        if let Ok(Some(v)) = self.db.get_view_state("tag_filter") {
+            self.tag_filter = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Ok(Some(v)) = self.db.get_view_state("collapsed") {
+            self.collapsed = v
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| s.parse::<i64>().ok())
+                .collect();
+        }
+        // Restore cursor to previously selected task
+        if let Ok(Some(v)) = self.db.get_view_state("selected_task_id") {
+            if let Ok(id) = v.parse::<i64>() {
+                let display = self.build_display_rows();
+                if let Some(pos) = display.iter().position(|dr| {
+                    matches!(dr, DisplayRow::Task { idx, .. } if self.tasks[*idx].task.id == id)
+                }) {
+                    self.table_state.select(Some(pos));
+                }
+            }
+        }
     }
 
     fn refresh_active_sessions(&mut self) {
@@ -754,6 +858,7 @@ impl App {
         if self.confirm_quit {
             if code == KeyCode::Char('y') {
                 self.close_all_claude_panes();
+                self.save_view_state();
                 self.quit = true;
             }
             self.confirm_quit = false;
@@ -799,6 +904,7 @@ impl App {
                 if running {
                     self.confirm_quit = true;
                 } else {
+                    self.save_view_state();
                     self.quit = true;
                 }
             }
