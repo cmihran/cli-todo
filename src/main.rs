@@ -552,6 +552,30 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('s') => {
+                if let Some(id) = self.selected_task_view().map(|tv| tv.task.id) {
+                    if let Some(idx) = self.tasks.iter().position(|t| t.task.id == id) {
+                        let new_status = self.tasks[idx].task.status.next();
+                        if self.db.update_status(id, new_status).is_ok() {
+                            self.tasks[idx].task.status = new_status;
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('S') => {
+                if let Some(id) = self.selected_task_view().map(|tv| tv.task.id) {
+                    if let Some(idx) = self.tasks.iter().position(|t| t.task.id == id) {
+                        let new_status = if self.tasks[idx].task.status == Status::Blocked {
+                            Status::Todo
+                        } else {
+                            Status::Blocked
+                        };
+                        if self.db.update_status(id, new_status).is_ok() {
+                            self.tasks[idx].task.status = new_status;
+                        }
+                    }
+                }
+            }
             KeyCode::Char('g') => {
                 self.group_by = self.group_by.next();
                 self.select_first_task();
@@ -1423,6 +1447,14 @@ fn render_help_popup(f: &mut Frame) {
         Line::from(vec![
             Span::styled("  t          ", Style::default().fg(Color::Cyan)),
             Span::styled("Filter by tag", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  s          ", Style::default().fg(Color::Cyan)),
+            Span::styled("Cycle status", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("  S          ", Style::default().fg(Color::Cyan)),
+            Span::styled("Toggle blocked", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
             Span::styled("  a          ", Style::default().fg(Color::Cyan)),

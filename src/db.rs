@@ -28,6 +28,15 @@ impl Status {
         }
     }
 
+    pub fn next(self) -> Self {
+        match self {
+            Status::Todo => Status::InProgress,
+            Status::InProgress => Status::Done,
+            Status::Done => Status::Todo,
+            Status::Blocked => Status::Todo,
+        }
+    }
+
     pub fn from_str(s: &str) -> Self {
         match s {
             "in_progress" => Status::InProgress,
