@@ -1995,6 +1995,18 @@ fn render_claude_pane(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(block, area);
 
     if let Some(p) = pane {
+        // Sync PTY dimensions to match the rendered area — prevents text cutoff
+        // when the layout changes (e.g., first spawn uses stale full-width area,
+        // but actual panel is only 55% wide after the split).
+        {
+            let needs_resize = p.parser.lock().ok().map_or(false, |parser| {
+                let (rows, cols) = parser.screen().size();
+                cols != inner_area.width || rows != inner_area.height
+            });
+            if needs_resize && inner_area.width > 0 && inner_area.height > 0 {
+                p.resize(inner_area.width, inner_area.height);
+            }
+        }
         if let Ok(parser) = p.parser.lock() {
             let screen = parser.screen();
             let pseudo_term = tui_term::widget::PseudoTerminal::new(screen);
