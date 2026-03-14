@@ -105,6 +105,80 @@ fn detect_active_session_ids() -> HashSet<String> {
     active
 }
 
+// ── Git status detection ─────────────────────────────────────────────────────
+
+#[derive(Default)]
+struct GitStatus {
+    branch: String,
+    changed_files: usize,
+    staged_files: usize,
+    unpushed_commits: usize,
+    worktree_count: usize,
+}
+
+fn detect_git_status() -> GitStatus {
+    let mut status = GitStatus::default();
+
+    // Current branch
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+    {
+        if out.status.success() {
+            status.branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        }
+    }
+
+    // Changed + staged files via porcelain status
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+    {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                if line.len() < 2 {
+                    continue;
+                }
+                let index = line.as_bytes()[0];
+                let worktree = line.as_bytes()[1];
+                if index != b' ' && index != b'?' {
+                    status.staged_files += 1;
+                }
+                if worktree != b' ' {
+                    status.changed_files += 1;
+                }
+            }
+        }
+    }
+
+    // Unpushed commits
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["rev-list", "--count", "@{upstream}..HEAD"])
+        .output()
+    {
+        if out.status.success() {
+            status.unpushed_commits = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0);
+        }
+    }
+
+    // Worktree count
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+    {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            status.worktree_count = text.lines().filter(|l| l.starts_with("worktree ")).count();
+        }
+    }
+
+    status
+}
+
 // ── App types ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
@@ -323,6 +397,9 @@ struct App {
     search_mode: bool,
     search_query: String,
     search_cursor: usize,
+    // Git status
+    git_status: GitStatus,
+    last_git_check: std::time::Instant,
 }
 
 // ── App logic ───────────────────────────────────────────────────────────────
@@ -382,6 +459,8 @@ impl App {
             search_mode: false,
             search_query: String::new(),
             search_cursor: 0,
+            git_status: detect_git_status(),
+            last_git_check: std::time::Instant::now(),
         };
         app.reload_tasks();
         app.restore_view_state();
@@ -1788,14 +1867,58 @@ fn render_header(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
                 .bg(Color::Rgb(20, 40, 50)),
         ));
     }
-    let header = Paragraph::new(Line::from(title)).block(
-        Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .border_type(BorderType::Plain)
-            .padding(Padding::new(1, 0, 1, 0)),
-    );
-    f.render_widget(header, area);
+    // Build git status spans for the right side
+    let mut git_spans: Vec<Span> = Vec::new();
+    let gs = &app.git_status;
+    if !gs.branch.is_empty() {
+        git_spans.push(Span::styled(" ", Style::default().fg(Color::DarkGray)));
+        git_spans.push(Span::styled(
+            &gs.branch,
+            Style::default().fg(Color::Magenta),
+        ));
+        if gs.staged_files > 0 {
+            git_spans.push(Span::styled(
+                format!("  +{}", gs.staged_files),
+                Style::default().fg(Color::Green),
+            ));
+        }
+        if gs.changed_files > 0 {
+            git_spans.push(Span::styled(
+                format!("  ~{}", gs.changed_files),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        if gs.unpushed_commits > 0 {
+            git_spans.push(Span::styled(
+                format!("  ↑{}", gs.unpushed_commits),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+        if gs.worktree_count > 1 {
+            git_spans.push(Span::styled(
+                format!("  ⌥{}", gs.worktree_count),
+                Style::default().fg(Color::Blue),
+            ));
+        }
+        git_spans.push(Span::styled("  ", Style::default()));
+    }
+
+    let block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .border_type(BorderType::Plain)
+        .padding(Padding::new(1, 0, 1, 0));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let header = Paragraph::new(Line::from(title));
+    f.render_widget(header, inner);
+
+    if !git_spans.is_empty() {
+        let git_line = Paragraph::new(Line::from(git_spans))
+            .alignment(ratatui::layout::Alignment::Right);
+        f.render_widget(git_line, inner);
+    }
 }
 
 fn render_tabs(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
@@ -3192,6 +3315,12 @@ fn main() -> io::Result<()> {
         if last_session_check.elapsed() >= std::time::Duration::from_secs(2) {
             app.refresh_active_sessions();
             last_session_check = std::time::Instant::now();
+        }
+
+        // Refresh git status every 5 seconds
+        if app.last_git_check.elapsed() >= std::time::Duration::from_secs(5) {
+            app.git_status = detect_git_status();
+            app.last_git_check = std::time::Instant::now();
         }
 
         if app.quit {
