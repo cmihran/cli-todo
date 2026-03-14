@@ -140,6 +140,7 @@ enum SortBy {
     Manual,
     Status,
     Alphabetical,
+    LastModified,
 }
 
 impl SortBy {
@@ -148,6 +149,7 @@ impl SortBy {
             SortBy::Manual => "manual",
             SortBy::Status => "status",
             SortBy::Alphabetical => "A-Z",
+            SortBy::LastModified => "modified",
         }
     }
 
@@ -155,7 +157,8 @@ impl SortBy {
         match self {
             SortBy::Manual => SortBy::Status,
             SortBy::Status => SortBy::Alphabetical,
-            SortBy::Alphabetical => SortBy::Manual,
+            SortBy::Alphabetical => SortBy::LastModified,
+            SortBy::LastModified => SortBy::Manual,
         }
     }
 }
@@ -424,6 +427,13 @@ impl App {
                         let mut v = kids.clone();
                         v.sort_by(|&a, &b| {
                             tasks[a].task.title.to_lowercase().cmp(&tasks[b].task.title.to_lowercase())
+                        });
+                        v
+                    }
+                    SortBy::LastModified => {
+                        let mut v = kids.clone();
+                        v.sort_by(|&a, &b| {
+                            tasks[b].task.updated_at.cmp(&tasks[a].task.updated_at)
                         });
                         v
                     }
