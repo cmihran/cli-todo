@@ -24,6 +24,7 @@ use ratatui::{
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, stdout};
+use unicode_width::UnicodeWidthStr;
 
 // ── UI helpers for Status/Priority colors ───────────────────────────────────
 
@@ -1619,10 +1620,39 @@ fn tree_prefix(display: &[DisplayRow], row_index: usize) -> String {
     prefix
 }
 
+/// Truncate a string to fit within `max_width` display columns, appending "…" if truncated.
+fn truncate_to_width(s: &str, max_width: usize) -> String {
+    let width = s.width();
+    if width <= max_width {
+        return s.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let mut result = String::new();
+    let mut current_width = 0;
+    let target = max_width.saturating_sub(1); // reserve 1 column for "…"
+    for ch in s.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width + cw > target {
+            break;
+        }
+        result.push(ch);
+        current_width += cw;
+    }
+    result.push('…');
+    result
+}
+
 fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     let display = app.build_display_rows();
     let display_len = display.len();
     let children_map = app.children_map();
+
+    // Compute available width for the title column:
+    // inner = area.width - border_right(1) - padding_left(1) - padding_right(1)
+    // title_width = inner - fixed_columns(2+6+14+10) - column_gaps(4×1)
+    let title_col_width = (area.width as usize).saturating_sub(39);
 
     let header = Row::new(vec![
         Cell::from(" "),
@@ -1682,6 +1712,7 @@ fn render_task_table(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) 
                     "  "
                 };
                 let title_text = format!("{}{}{}", prefix, collapse_ind, task.title);
+                let title_text = truncate_to_width(&title_text, title_col_width);
                 let title_cell = Cell::from(Span::styled(
                     title_text,
                     Style::default().fg(Color::White),

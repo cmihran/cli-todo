@@ -17,3 +17,4 @@ portable-pty = "0.9"
 tui-term = "0.3"
 vt100 = "0.16"
 uuid = { version = "1", features = ["v4"] }
+unicode-width = "0.2"
